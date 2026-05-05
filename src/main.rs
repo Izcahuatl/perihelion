@@ -4,9 +4,10 @@ use sherpa_onnx::{
     OfflineModelConfig, OfflineQwen3ASRModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
     Wave,
 };
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +23,11 @@ const MODEL_FILES: &[&str] = &[
     "tokenizer/vocab.json",
 ];
 
+const STRIP_TAGS: &[&str] = &[
+    "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>",
+    "<|de|>", "<|it|>", "<|es|>", "<|ru|>", "<|asr|>", "<|text|>",
+];
+
 #[derive(Debug, Clone)]
 enum DownloadEvent {
     Progress { file: String, bytes: u64, total: u64 },
@@ -31,7 +37,7 @@ enum DownloadEvent {
 }
 
 enum InitEvent {
-    Success(AsrEngine, Arc<StreamingEngine>),
+    Success(Arc<AsrEngine>),
     Error(String),
 }
 
@@ -42,63 +48,75 @@ enum TranscriptionEvent {
     Error(String),
 }
 
-pub struct StreamingEngine {
+fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<OfflineRecognizer> {
+    let hotwords_file = if !settings.hotwords.trim().is_empty() {
+        let hw_path = model_dir.join("hotwords.txt");
+        if let Ok(mut f) = std::fs::File::create(&hw_path) {
+            let _ = f.write_all(settings.hotwords.as_bytes());
+        }
+        hw_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+
+    let mut config = OfflineRecognizerConfig::default();
+    config.decoding_method = Some(if settings.high_accuracy {
+        "modified_beam_search".to_string()
+    } else {
+        "greedy_search".to_string()
+    });
+    config.max_active_paths = settings.search_depth;
+    config.hotwords_file = Some(hotwords_file);
+    config.hotwords_score = settings.hotwords_boost;
+
+    config.model_config = OfflineModelConfig {
+        qwen3_asr: OfflineQwen3ASRModelConfig {
+            conv_frontend: Some(
+                model_dir.join("conv_frontend.onnx").to_string_lossy().into_owned(),
+            ),
+            encoder: Some(
+                model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned(),
+            ),
+            decoder: Some(
+                model_dir.join("decoder.int8.onnx").to_string_lossy().into_owned(),
+            ),
+            tokenizer: Some(
+                model_dir.join("tokenizer").to_string_lossy().into_owned(),
+            ),
+            ..Default::default()
+        },
+        num_threads: settings.num_threads,
+        provider: Some(settings.provider.clone()),
+        debug: false,
+        ..Default::default()
+    };
+
+    OfflineRecognizer::create(&config)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create OfflineRecognizer"))
+}
+
+fn clean_transcription(text: &str) -> String {
+    let mut result = text.to_string();
+    for tag in STRIP_TAGS {
+        if result.contains(tag) {
+            result = result.replace(tag, "");
+        }
+    }
+    result.trim().to_string()
+}
+
+pub struct AsrEngine {
     recognizer: OfflineRecognizer,
     audio_buffer: Arc<Mutex<Vec<f32>>>,
 }
 
-impl StreamingEngine {
+impl AsrEngine {
     pub fn new(model_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
-        let hotwords_file = if !settings.hotwords.trim().is_empty() {
-            let hw_path = model_dir.join("hotwords.txt");
-            if let Ok(mut f) = std::fs::File::create(&hw_path) {
-                let _ = f.write_all(settings.hotwords.as_bytes());
-            }
-            hw_path.to_string_lossy().into_owned()
-        } else {
-            String::new()
-        };
-
-        let mut config = OfflineRecognizerConfig::default();
-        config.decoding_method = Some(if settings.high_accuracy { "modified_beam_search".to_string() } else { "greedy_search".to_string() });
-        config.max_active_paths = settings.search_depth;
-        config.hotwords_file = Some(hotwords_file);
-        config.hotwords_score = settings.hotwords_boost;
-
-        config.model_config = OfflineModelConfig {
-            qwen3_asr: OfflineQwen3ASRModelConfig {
-                conv_frontend: Some(
-                    model_dir.join("conv_frontend.onnx").to_string_lossy().into_owned(),
-                ),
-                encoder: Some(
-                    model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned(),
-                ),
-                decoder: Some(
-                    model_dir.join("decoder.int8.onnx").to_string_lossy().into_owned(),
-                ),
-                tokenizer: Some(
-                    model_dir.join("tokenizer").to_string_lossy().into_owned(),
-                ),
-                ..Default::default()
-            },
-            num_threads: settings.num_threads,
-            provider: Some(settings.provider.clone()),
-            debug: false,
-            ..Default::default()
-        };
-
-        let recognizer = OfflineRecognizer::create(&config)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create OfflineRecognizer"))?;
-
+        let recognizer = build_recognizer(model_dir, settings)?;
         Ok(Self {
             recognizer,
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
         })
-    }
-
-    pub fn add_samples(&self, samples: &[f32]) {
-        let mut buffer = self.audio_buffer.lock().unwrap();
-        buffer.extend_from_slice(samples);
     }
 
     pub fn extend_samples<I: IntoIterator<Item = f32>>(&self, iter: I) {
@@ -106,19 +124,21 @@ impl StreamingEngine {
         buffer.extend(iter);
     }
 
-    pub fn get_buffered_samples(&self, min_samples: usize) -> Option<Vec<f32>> {
+    // I'm so fucking scared brah
+    pub fn check_new_audio(&self, since: usize, min_total: usize) -> Option<(f32, usize)> {
         let buffer = self.audio_buffer.lock().unwrap();
-        if buffer.len() >= min_samples {
-            Some(buffer.clone())
-        } else {
-            None
+        if buffer.len() < min_total || buffer.len() <= since {
+            return None;
         }
+        let new_samples = &buffer[since..];
+        let sum_sq: f32 = new_samples.iter().map(|s| s * s).sum();
+        let rms = (sum_sq / new_samples.len() as f32).sqrt();
+        Some((rms, buffer.len()))
     }
 
     pub fn clear_buffer(&self) -> Vec<f32> {
         let mut buffer = self.audio_buffer.lock().unwrap();
-        let len = buffer.len();
-        buffer.drain(0..len).collect()
+        std::mem::take(&mut *buffer)
     }
 
     pub fn transcribe_samples(&self, sample_rate: i32, samples: &[f32]) -> anyhow::Result<String> {
@@ -127,56 +147,6 @@ impl StreamingEngine {
         self.recognizer.decode(&stream);
         let result = stream.get_result();
         Ok(result.map(|r| r.text).unwrap_or_default())
-    }
-}
-
-pub struct AsrEngine {
-    recognizer: OfflineRecognizer,
-}
-
-impl AsrEngine {
-    pub fn new(model_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
-        let hotwords_file = if !settings.hotwords.trim().is_empty() {
-            let hw_path = model_dir.join("hotwords.txt");
-            if let Ok(mut f) = std::fs::File::create(&hw_path) {
-                let _ = f.write_all(settings.hotwords.as_bytes());
-            }
-            hw_path.to_string_lossy().into_owned()
-        } else {
-            String::new()
-        };
-
-        let mut config = OfflineRecognizerConfig::default();
-        config.decoding_method = Some(if settings.high_accuracy { "modified_beam_search".to_string() } else { "greedy_search".to_string() });
-        config.max_active_paths = settings.search_depth;
-        config.hotwords_file = Some(hotwords_file);
-        config.hotwords_score = settings.hotwords_boost;
-
-        config.model_config = OfflineModelConfig {
-            qwen3_asr: OfflineQwen3ASRModelConfig {
-                conv_frontend: Some(
-                    model_dir.join("conv_frontend.onnx").to_string_lossy().into_owned(),
-                ),
-                encoder: Some(
-                    model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned(),
-                ),
-                decoder: Some(
-                    model_dir.join("decoder.int8.onnx").to_string_lossy().into_owned(),
-                ),
-                tokenizer: Some(
-                    model_dir.join("tokenizer").to_string_lossy().into_owned(),
-                ),
-                ..Default::default()
-            },
-            num_threads: settings.num_threads,
-            provider: Some(settings.provider.clone()),
-            debug: false,
-            ..Default::default()
-        };
-
-        let recognizer = OfflineRecognizer::create(&config)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create OfflineRecognizer"))?;
-        Ok(Self { recognizer })
     }
 
     pub fn transcribe_file(&self, wav_path: &Path) -> anyhow::Result<String> {
@@ -280,9 +250,8 @@ pub struct PerihelionApp {
     status_message: String,
     settings: Settings,
     test_file_path: String,
-    asr_engine: Option<AsrEngine>,
-    streaming_engine: Option<Arc<StreamingEngine>>,
-    audio_running: Arc<Mutex<bool>>,
+    engine: Option<Arc<AsrEngine>>,
+    audio_running: Arc<AtomicBool>,
     model_dir: PathBuf,
     osc_socket: Option<UdpSocket>,
     available_devices: Vec<String>,
@@ -413,18 +382,11 @@ impl PerihelionApp {
         thread::spawn(move || {
             if Self::check_model_exists(&model_dir) {
                 match AsrEngine::new(&model_dir, &settings) {
-                    Ok(asr) => {
-                        match StreamingEngine::new(&model_dir, &settings) {
-                            Ok(streaming) => {
-                                let _ = tx.send(InitEvent::Success(asr, Arc::new(streaming)));
-                            }
-                            Err(e) => {
-                                let _ = tx.send(InitEvent::Error(format!("Streaming Engine error: {}", e)));
-                            }
-                        }
+                    Ok(engine) => {
+                        let _ = tx.send(InitEvent::Success(Arc::new(engine)));
                     }
                     Err(e) => {
-                        let _ = tx.send(InitEvent::Error(format!("ASR Engine error: {}", e)));
+                        let _ = tx.send(InitEvent::Error(format!("Engine error: {}", e)));
                     }
                 }
             } else {
@@ -441,9 +403,8 @@ impl PerihelionApp {
         };
         if let Some(event) = event {
             match event {
-                InitEvent::Success(asr, streaming) => {
-                    self.asr_engine = Some(asr);
-                    self.streaming_engine = Some(streaming);
+                InitEvent::Success(engine) => {
+                    self.engine = Some(engine);
                     self.model_status = ModelStatus::Ready;
                     self.status_message = "Ready".to_string();
                 }
@@ -538,15 +499,15 @@ impl PerihelionApp {
     }
 
     fn start_audio_capture(&mut self) {
-        if self.streaming_engine.is_none() {
-            self.status_message = "Streaming engine not ready".to_string();
+        if self.engine.is_none() {
+            self.status_message = "Engine not ready".to_string();
             return;
         }
 
-        let engine = self.streaming_engine.clone().unwrap();
+        let engine = self.engine.clone().unwrap();
         let (tx, rx) = channel();
         self.transcription_rx = Some(rx);
-        self.audio_running = Arc::new(Mutex::new(true));
+        self.audio_running = Arc::new(AtomicBool::new(true));
         let running = self.audio_running.clone();
         let device_index = self.selected_device;
 
@@ -556,7 +517,7 @@ impl PerihelionApp {
     }
 
     fn stop_audio_capture(&mut self) {
-        *self.audio_running.lock().unwrap() = false;
+        self.audio_running.store(false, Ordering::Relaxed);
         self.transcription_rx = None;
     }
 
@@ -668,9 +629,11 @@ impl Default for PerihelionApp {
         });
         let available_devices = Self::get_available_devices();
 
-        let config = Self::load_config();
-        let settings = config.as_ref().map(|c| c.settings.clone()).unwrap_or_default();
-        let selected_device = config.map(|c| c.selected_device).unwrap_or(0)
+        let (settings, selected_device) = match Self::load_config() {
+            Some(c) => (c.settings, c.selected_device),
+            None => (Settings::default(), 0),
+        };
+        let selected_device = selected_device
             .min(available_devices.len().saturating_sub(1));
 
         let mut app = Self {
@@ -690,9 +653,8 @@ impl Default for PerihelionApp {
             status_message: "Ready".to_string(),
             settings,
             test_file_path: String::new(),
-            asr_engine: None,
-            streaming_engine: None,
-            audio_running: Arc::new(Mutex::new(false)),
+            engine: None,
+            audio_running: Arc::new(AtomicBool::new(false)),
             model_dir,
             osc_socket,
             available_devices,
@@ -1073,8 +1035,7 @@ impl eframe::App for PerihelionApp {
                             ui.add_space(4.0);
                             if ui.button(egui::RichText::new("Annihilate Model").size(16.0).color(egui::Color32::RED)).clicked() {
                                 let _ = std::fs::remove_dir_all(&self.model_dir);
-                                self.asr_engine = None;
-                                self.streaming_engine = None;
+                                self.engine = None;
                                 self.model_status = ModelStatus::NotDownloaded;
                                 self.status_message = "Model files gone".to_string();
                             }
@@ -1103,7 +1064,7 @@ impl eframe::App for PerihelionApp {
                             egui::TextEdit::singleline(&mut self.test_file_path).hint_text("Path to .wav file"),
                         );
                         if ui.button("Run").clicked() {
-                            if let Some(engine) = &self.asr_engine {
+                            if let Some(engine) = &self.engine {
                                 let path = Path::new(&self.test_file_path);
                                 match engine.transcribe_file(path) {
                                     Ok(text) => self.append_text(&text),
@@ -1156,20 +1117,24 @@ fn download_file_with_progress(
     let mut response = reqwest::blocking::get(url)
         .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
     let total_size = response.content_length().unwrap_or(0);
-    let mut file = std::fs::File::create(dest)?;
-    let mut buffer = [0u8; 8192];
+    let mut file = BufWriter::new(std::fs::File::create(dest)?);
+    let mut buffer = [0u8; 65536];
     let mut downloaded: u64 = 0;
+    let mut last_reported: u64 = 0;
     while let Ok(n) = response.read(&mut buffer) {
         if n == 0 {
             break;
         }
         file.write_all(&buffer[..n])?;
         downloaded += n as u64;
-        let _ = tx.send(DownloadEvent::Progress {
-            file: filename.to_string(),
-            bytes: downloaded,
-            total: total_size,
-        });
+        if downloaded - last_reported >= 262_144 || downloaded == total_size {
+            last_reported = downloaded;
+            let _ = tx.send(DownloadEvent::Progress {
+                file: filename.to_string(),
+                bytes: downloaded,
+                total: total_size,
+            });
+        }
     }
     Ok(())
 }
@@ -1242,8 +1207,8 @@ fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
 
 fn run_audio_capture(
     tx: Sender<TranscriptionEvent>,
-    streaming_engine: Arc<StreamingEngine>,
-    running: Arc<Mutex<bool>>,
+    engine: Arc<AsrEngine>,
+    running: Arc<AtomicBool>,
     device_index: usize,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1283,7 +1248,7 @@ fn run_audio_capture(
     let chunk_size = ((sample_rate as usize) / 2).max(4096);
 
     // Create stream
-    let engine_clone = streaming_engine.clone();
+    let engine_clone = engine.clone();
     let running_clone = running.clone();
 
     // Clear buffer from previous runs before starting capture
@@ -1294,7 +1259,7 @@ fn run_audio_capture(
             device.build_input_stream(
                 &config.config(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if !*running_clone.lock().unwrap() {
+                    if !running_clone.load(Ordering::Relaxed) {
                         return;
                     }
 
@@ -1314,7 +1279,7 @@ fn run_audio_capture(
             device.build_input_stream(
                 &config.config(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    if !*running_clone.lock().unwrap() {
+                    if !running_clone.load(Ordering::Relaxed) {
                         return;
                     }
 
@@ -1335,7 +1300,7 @@ fn run_audio_capture(
             device.build_input_stream(
                 &config.config(),
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    if !*running_clone.lock().unwrap() {
+                    if !running_clone.load(Ordering::Relaxed) {
                         return;
                     }
 
@@ -1370,74 +1335,57 @@ fn run_audio_capture(
             let mut is_speaking = false;
 
             // Keep the stream alive while running
-            while *running.lock().unwrap() {
+            while running.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
-                if let Some(samples) = streaming_engine.get_buffered_samples(chunk_size) {
-                    if samples.len() > last_len {
-                        let new_samples = &samples[last_len..];
-                        last_len = samples.len();
+                if let Some((rms, total_len)) = engine.check_new_audio(last_len, chunk_size) {
+                    last_len = total_len;
 
-                        let mut sum_sq = 0.0;
-                        for &s in new_samples {
-                            sum_sq += s * s;
-                        }
-                        let rms = if new_samples.is_empty() { 0.0 } else { (sum_sq / new_samples.len() as f32).sqrt() };
+                    if rms < 0.005 {
+                        silence_chunks += 1;
+                    } else {
+                        silence_chunks = 0;
+                        is_speaking = true;
+                    }
 
-                        if rms < 0.005 {
-                            silence_chunks += 1;
-                        } else {
-                            silence_chunks = 0;
-                            is_speaking = true;
-                        }
-
-                        if !is_speaking {
-                            // If we haven't started speaking yet, clear out old silence so it doesn't build up
-                            if samples.len() > sample_rate as usize * 3 {
-                                streaming_engine.clear_buffer();
-                                last_len = 0;
-                            }
-                            continue;
-                        }
-
-                        // If user stopped speaking (1.5 seconds of silence = 3 chunks)
-                        if silence_chunks >= 3 {
-                            let samples_to_process = streaming_engine.clear_buffer();
+                    if !is_speaking {
+                        // If we haven't started speaking yet, clear out old silence so it doesn't build up
+                        if total_len > sample_rate as usize * 3 {
+                            engine.clear_buffer();
                             last_len = 0;
-                            silence_chunks = 0;
-                            is_speaking = false;
+                        }
+                        continue;
+                    }
 
-                            if !samples_to_process.is_empty() {
-                                let resampled = resample_linear(&samples_to_process, sample_rate as u32, 16000);
-                                if let Ok(text) = streaming_engine.transcribe_samples(16000, &resampled) {
-                                    let mut clean_text = text;
-                                    for tag in &["<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>", "<|de|>", "<|it|>", "<|es|>", "<|ru|>", "<|asr|>", "<|text|>"] {
-                                        clean_text = clean_text.replace(tag, "");
-                                    }
-                                    let clean_text = clean_text.trim().to_string();
-                                    if !clean_text.is_empty() {
-                                        let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
-                                    } else {
-                                        let _ = tx.send(TranscriptionEvent::PartialResult("".to_string()));
-                                    }
+                    // If user stopped speaking (1.5 seconds of silence = 3 chunks)
+                    if silence_chunks >= 3 {
+                        let samples_to_process = engine.clear_buffer();
+                        last_len = 0;
+                        silence_chunks = 0;
+                        is_speaking = false;
+
+                        if !samples_to_process.is_empty() {
+                            let resampled = resample_linear(&samples_to_process, sample_rate as u32, 16000);
+                            if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
+                                let clean_text = clean_transcription(&text);
+                                if !clean_text.is_empty() {
+                                    let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
+                                } else {
+                                    let _ = tx.send(TranscriptionEvent::PartialResult("".to_string()));
                                 }
                             }
-                            continue;
                         }
+                        continue;
                     }
                 }
             }
 
             // Transcribe any remaining samples and clear out the buffer
-            let samples = streaming_engine.clear_buffer();
+            let samples = engine.clear_buffer();
             if !samples.is_empty() && is_speaking {
                 let resampled = resample_linear(&samples, sample_rate as u32, 16000);
-                if let Ok(text) = streaming_engine.transcribe_samples(16000, &resampled) {
-                    let mut clean_text = text;
-                    for tag in &["<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>", "<|de|>", "<|it|>", "<|es|>", "<|ru|>", "<|asr|>", "<|text|>"] {
-                        clean_text = clean_text.replace(tag, "");
-                    }
-                    let clean_text = clean_text.trim().to_string();
+                if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
+                    let clean_text = clean_transcription(&text);
                     if !clean_text.is_empty() {
                         let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
                     }
