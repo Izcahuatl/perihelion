@@ -19,6 +19,7 @@ Grab the latest build from [Releases](../../releases). Duh.
 ## First launch
 The app will download the model (~1 GB) on first run. This takes a minute depending on your internet. That's it.
 After that, subsequent launches will load the model immediately.
+
 ---
 ## How to use this thing
 Honestly a lot of it is self-explanatory, but here's some more important stuff so you're not confused.
