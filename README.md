@@ -1,7 +1,7 @@
 # Perihelion
 **STT app made for VRChat!!**
 
-Perihelion runs a tiny (not) Qwen3 ASR model directly on your machine and connects it to VRChat.
+Perihelion runs a tiny (not) ASR model directly on your machine and connects it to VRChat
 
 ---
 ## Features?
