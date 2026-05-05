@@ -45,7 +45,7 @@ One word or phrase per line. The model will try harder to recognize these. Hotwo
 ## Will it run on my grandma's life support?
 If your PC can handle 5 eboy avatars it can handle this.
 
-The model download is ~1 GB and it uses about 2 GB of RAM while running
+The model download is ~1 GB and it uses about 1.1 GB of RAM while running
 
 ---
 ## Building it yourself
