@@ -86,7 +86,7 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
             ..Default::default()
         },
         num_threads: settings.num_threads,
-        provider: Some(settings.provider.clone()),
+        provider: Some(settings.provider.as_config_str().to_string()),
         debug: false,
         ..Default::default()
     };
@@ -185,6 +185,29 @@ impl ListeningMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Provider {
+    Cpu,
+    Dml,
+    Cuda,
+}
+
+impl Default for Provider {
+    fn default() -> Self {
+        Provider::Cpu
+    }
+}
+
+impl Provider {
+    pub fn as_config_str(&self) -> &'static str {
+        match self {
+            Provider::Cpu => "cpu",
+            Provider::Dml => "dml",
+            Provider::Cuda => "cuda",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub listening_mode: ListeningMode,
@@ -195,7 +218,7 @@ pub struct Settings {
     pub search_depth: i32,
     pub hotwords: String,
     pub hotwords_boost: f32,
-    pub provider: String,
+    pub provider: Provider,
 }
 
 impl Default for Settings {
@@ -209,7 +232,7 @@ impl Default for Settings {
             search_depth: 4,
             hotwords: String::new(),
             hotwords_boost: 1.5,
-            provider: "cpu".to_string(),
+            provider: Provider::default(),
         }
     }
 }
@@ -418,11 +441,8 @@ impl PerihelionApp {
     }
 
     fn handle_download_events(&mut self) {
-        let events: Vec<DownloadEvent> = if let Some(rx) = &self.download_rx {
-            rx.try_iter().collect()
-        } else {
-            Vec::new()
-        };
+        let Some(rx) = &self.download_rx else { return };
+        let events: Vec<DownloadEvent> = rx.try_iter().collect();
         for event in events {
             match event {
                 DownloadEvent::Progress {
@@ -461,11 +481,8 @@ impl PerihelionApp {
     }
 
     fn handle_osc_events(&mut self) {
-        let events: Vec<bool> = if let Some(rx) = &self.osc_rx {
-            rx.try_iter().collect()
-        } else {
-            Vec::new()
-        };
+        let Some(rx) = &self.osc_rx else { return };
+        let events: Vec<bool> = rx.try_iter().collect();
         for on in events {
             self.set_listening(on);
             self.status_message = if on {
@@ -477,11 +494,8 @@ impl PerihelionApp {
     }
 
     fn handle_transcription_events(&mut self) {
-        let events: Vec<TranscriptionEvent> = if let Some(rx) = &self.transcription_rx {
-            rx.try_iter().collect()
-        } else {
-            Vec::new()
-        };
+        let Some(rx) = &self.transcription_rx else { return };
+        let events: Vec<TranscriptionEvent> = rx.try_iter().collect();
         for event in events {
             match event {
                 TranscriptionEvent::PartialResult(text) => {
@@ -575,15 +589,11 @@ impl PerihelionApp {
         }
     }
 
-    fn send_osc_chatbox(&self, text: &str) {
+    fn send_osc_message(&self, addr: &str, args: Vec<rosc::OscType>) {
         if let Some(socket) = &self.osc_socket {
-            let truncated: String = text.chars().take(140).collect();
             let msg = rosc::OscPacket::Message(rosc::OscMessage {
-                addr: "/chatbox/input".to_string(),
-                args: vec![
-                    rosc::OscType::String(truncated),
-                    rosc::OscType::Bool(true),
-                ],
+                addr: addr.to_string(),
+                args,
             });
             if let Ok(bytes) = rosc::encoder::encode(&msg) {
                 let _ = socket.send(&bytes);
@@ -591,16 +601,16 @@ impl PerihelionApp {
         }
     }
 
+    fn send_osc_chatbox(&self, text: &str) {
+        let truncated: String = text.chars().take(140).collect();
+        self.send_osc_message("/chatbox/input", vec![
+            rosc::OscType::String(truncated),
+            rosc::OscType::Bool(true),
+        ]);
+    }
+
     fn send_osc_typing(&self, typing: bool) {
-        if let Some(socket) = &self.osc_socket {
-            let msg = rosc::OscPacket::Message(rosc::OscMessage {
-                addr: "/chatbox/typing".to_string(),
-                args: vec![rosc::OscType::Bool(typing)],
-            });
-            if let Ok(bytes) = rosc::encoder::encode(&msg) {
-                let _ = socket.send(&bytes);
-            }
-        }
+        self.send_osc_message("/chatbox/typing", vec![rosc::OscType::Bool(typing)]);
     }
 
     fn start_listening(&mut self) {
@@ -895,7 +905,7 @@ impl eframe::App for PerihelionApp {
 
                     // Status
                     ui.horizontal(|ui| {
-                        ui.label(self.status_message.clone());
+                        ui.label(&self.status_message);
                         if self.is_listening {
                             ui.spinner();
                         }
@@ -993,9 +1003,9 @@ impl eframe::App for PerihelionApp {
                             ui.add_space(12.0);
                             ui.label("Hardware Processor:");
                             ui.horizontal_wrapped(|ui| {
-                                ui.radio_value(&mut self.settings.provider, "cpu".to_string(), "CPU");
-                                ui.radio_value(&mut self.settings.provider, "dml".to_string(), "GPU");
-                                ui.radio_value(&mut self.settings.provider, "cuda".to_string(), "GPU-CUDA)");
+                                ui.radio_value(&mut self.settings.provider, Provider::Cpu, "CPU");
+                                ui.radio_value(&mut self.settings.provider, Provider::Dml, "GPU");
+                                ui.radio_value(&mut self.settings.provider, Provider::Cuda, "GPU-CUDA)");
                             });
 
                             ui.add_space(12.0);
@@ -1189,13 +1199,13 @@ fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     if in_rate == out_rate {
         return input.to_vec();
     }
-    let ratio = in_rate as f32 / out_rate as f32;
-    let out_len = (input.len() as f32 / ratio).floor() as usize;
+    let ratio = in_rate as f64 / out_rate as f64;
+    let out_len = (input.len() as f64 / ratio).floor() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
-        let in_pos = i as f32 * ratio;
+        let in_pos = i as f64 * ratio;
         let idx = in_pos.floor() as usize;
-        let frac = in_pos - idx as f32;
+        let frac = (in_pos - idx as f64) as f32;
         if idx + 1 < input.len() {
             out.push(input[idx] * (1.0 - frac) + input[idx + 1] * frac);
         } else if idx < input.len() {
