@@ -98,9 +98,7 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
 fn clean_transcription(text: &str) -> String {
     let mut result = text.to_string();
     for tag in STRIP_TAGS {
-        if result.contains(tag) {
-            result = result.replace(tag, "");
-        }
+        result = result.replace(tag, "");
     }
     result.trim().to_string()
 }
