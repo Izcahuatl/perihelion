@@ -8,7 +8,7 @@ use std::io::{BufWriter, Read, Write};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -24,13 +24,17 @@ const MODEL_FILES: &[&str] = &[
 ];
 
 const STRIP_TAGS: &[&str] = &[
-    "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>",
-    "<|de|>", "<|it|>", "<|es|>", "<|ru|>", "<|asr|>", "<|text|>",
+    "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>", "<|de|>", "<|it|>", "<|es|>", "<|ru|>",
+    "<|asr|>", "<|text|>",
 ];
 
 #[derive(Debug, Clone)]
 enum DownloadEvent {
-    Progress { file: String, bytes: u64, total: u64 },
+    Progress {
+        file: String,
+        bytes: u64,
+        total: u64,
+    },
     FileDone(String),
     Error(String),
     AllDone,
@@ -72,17 +76,24 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
     config.model_config = OfflineModelConfig {
         qwen3_asr: OfflineQwen3ASRModelConfig {
             conv_frontend: Some(
-                model_dir.join("conv_frontend.onnx").to_string_lossy().into_owned(),
+                model_dir
+                    .join("conv_frontend.onnx")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             encoder: Some(
-                model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned(),
+                model_dir
+                    .join("encoder.int8.onnx")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             decoder: Some(
-                model_dir.join("decoder.int8.onnx").to_string_lossy().into_owned(),
+                model_dir
+                    .join("decoder.int8.onnx")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
-            tokenizer: Some(
-                model_dir.join("tokenizer").to_string_lossy().into_owned(),
-            ),
+            tokenizer: Some(model_dir.join("tokenizer").to_string_lossy().into_owned()),
             ..Default::default()
         },
         num_threads: settings.num_threads,
@@ -240,7 +251,11 @@ impl Default for Settings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStatus {
     NotDownloaded,
-    Downloading { current_file: String, current_bytes: u64, total_bytes: u64 },
+    Downloading {
+        current_file: String,
+        current_bytes: u64,
+        total_bytes: u64,
+    },
     Initializing,
     Ready,
     Error(String),
@@ -445,11 +460,7 @@ impl PerihelionApp {
         let events: Vec<DownloadEvent> = rx.try_iter().collect();
         for event in events {
             match event {
-                DownloadEvent::Progress {
-                    file,
-                    bytes,
-                    total,
-                } => {
+                DownloadEvent::Progress { file, bytes, total } => {
                     self.model_status = ModelStatus::Downloading {
                         current_file: file,
                         current_bytes: bytes,
@@ -494,7 +505,9 @@ impl PerihelionApp {
     }
 
     fn handle_transcription_events(&mut self) {
-        let Some(rx) = &self.transcription_rx else { return };
+        let Some(rx) = &self.transcription_rx else {
+            return;
+        };
         let events: Vec<TranscriptionEvent> = rx.try_iter().collect();
         for event in events {
             match event {
@@ -603,10 +616,10 @@ impl PerihelionApp {
 
     fn send_osc_chatbox(&self, text: &str) {
         let truncated: String = text.chars().take(140).collect();
-        self.send_osc_message("/chatbox/input", vec![
-            rosc::OscType::String(truncated),
-            rosc::OscType::Bool(true),
-        ]);
+        self.send_osc_message(
+            "/chatbox/input",
+            vec![rosc::OscType::String(truncated), rosc::OscType::Bool(true)],
+        );
     }
 
     fn send_osc_typing(&self, typing: bool) {
@@ -634,17 +647,16 @@ impl Default for PerihelionApp {
     fn default() -> Self {
         let model_dir = Self::model_dir();
         let model_exists = Self::check_model_exists(&model_dir);
-        let osc_socket = UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
-            s.connect("127.0.0.1:9000").ok().map(|_| s)
-        });
+        let osc_socket = UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| s.connect("127.0.0.1:9000").ok().map(|_| s));
         let available_devices = Self::get_available_devices();
 
         let (settings, selected_device) = match Self::load_config() {
             Some(c) => (c.settings, c.selected_device),
             None => (Settings::default(), 0),
         };
-        let selected_device = selected_device
-            .min(available_devices.len().saturating_sub(1));
+        let selected_device = selected_device.min(available_devices.len().saturating_sub(1));
 
         let mut app = Self {
             view: View::default(),
@@ -690,19 +702,27 @@ impl eframe::App for PerihelionApp {
         self.handle_osc_events();
         self.sync_listening_state();
 
-        if matches!(self.model_status, ModelStatus::Downloading { .. } | ModelStatus::Initializing) || self.is_listening {
+        if matches!(
+            self.model_status,
+            ModelStatus::Downloading { .. } | ModelStatus::Initializing
+        ) || self.is_listening
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         if self.model_status == ModelStatus::Initializing {
             egui::CentralPanel::default()
-                .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0)))
+                .frame(
+                    egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0)),
+                )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() / 2.0 - 40.0);
                         ui.add_sized([40.0, 40.0], egui::Spinner::new());
                         ui.add_space(20.0);
-                        ui.heading(egui::RichText::new("Hang on, the model's starting!").size(24.0));
+                        ui.heading(
+                            egui::RichText::new("Hang on, the model's starting!").size(24.0),
+                        );
                     });
                 });
             return;
@@ -712,28 +732,21 @@ impl eframe::App for PerihelionApp {
         egui::SidePanel::left("sidebar")
             .resizable(false)
             .exact_width(100.0)
-            .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::same(6.0)),
-            )
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::same(6.0)))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
                     ui.add_space(4.0);
 
-                    let mut sel =
-                        |ui: &mut egui::Ui, label: &str, view: View| {
-                            let active = self.view == view;
-                            if ui
-                                .add_sized(
-                                    [88.0, 28.0],
-                                    egui::SelectableLabel::new(active, label),
-                                )
-                                .clicked()
-                            {
-                                self.view = view;
-                            }
-                        };
+                    let mut sel = |ui: &mut egui::Ui, label: &str, view: View| {
+                        let active = self.view == view;
+                        if ui
+                            .add_sized([88.0, 28.0], egui::SelectableLabel::new(active, label))
+                            .clicked()
+                        {
+                            self.view = view;
+                        }
+                    };
 
                     sel(ui, "Main", View::Main);
                     sel(ui, "Settings", View::Settings);
@@ -743,8 +756,7 @@ impl eframe::App for PerihelionApp {
             });
 
         // Content
-        let frame = egui::Frame::central_panel(&ctx.style())
-            .inner_margin(egui::Margin::same(20.0));
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0));
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let avail = ui.available_width();
@@ -1124,8 +1136,8 @@ fn download_file_with_progress(
     tx: &std::sync::mpsc::Sender<DownloadEvent>,
     filename: &str,
 ) -> anyhow::Result<()> {
-    let mut response = reqwest::blocking::get(url)
-        .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+    let mut response =
+        reqwest::blocking::get(url).map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
     let total_size = response.content_length().unwrap_or(0);
     let mut file = BufWriter::new(std::fs::File::create(dest)?);
     let mut buffer = [0u8; 65536];
@@ -1199,13 +1211,13 @@ fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     if in_rate == out_rate {
         return input.to_vec();
     }
-    let ratio = in_rate as f64 / out_rate as f64;
-    let out_len = (input.len() as f64 / ratio).floor() as usize;
+    let ratio = in_rate as f32 / out_rate as f32;
+    let out_len = (input.len() as f32 / ratio).floor() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
-        let in_pos = i as f64 * ratio;
-        let idx = in_pos.floor() as usize;
-        let frac = (in_pos - idx as f64) as f32;
+        let in_pos = i as f32 * ratio;
+        let idx = in_pos as usize;
+        let frac = in_pos - idx as f32;
         if idx + 1 < input.len() {
             out.push(input[idx] * (1.0 - frac) + input[idx + 1] * frac);
         } else if idx < input.len() {
@@ -1230,7 +1242,10 @@ fn run_audio_capture(
         let mut device_iter = match host.input_devices() {
             Ok(iter) => iter,
             Err(e) => {
-                let _ = tx.send(TranscriptionEvent::Error(format!("Failed to get devices: {}", e)));
+                let _ = tx.send(TranscriptionEvent::Error(format!(
+                    "Failed to get devices: {}",
+                    e
+                )));
                 return;
             }
         };
@@ -1238,7 +1253,9 @@ fn run_audio_capture(
         match device_iter.nth(device_index) {
             Some(d) => d,
             None => {
-                let _ = tx.send(TranscriptionEvent::Error("Selected device not found".to_string()));
+                let _ = tx.send(TranscriptionEvent::Error(
+                    "Selected device not found".to_string(),
+                ));
                 return;
             }
         }
@@ -1247,7 +1264,10 @@ fn run_audio_capture(
     let config = match device.default_input_config() {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(TranscriptionEvent::Error(format!("Failed to get config: {}", e)));
+            let _ = tx.send(TranscriptionEvent::Error(format!(
+                "Failed to get config: {}",
+                e
+            )));
             return;
         }
     };
@@ -1265,70 +1285,66 @@ fn run_audio_capture(
     engine_clone.clear_buffer();
 
     let stream_result = match config.sample_format() {
-        cpal::SampleFormat::F32 => {
-            device.build_input_stream(
-                &config.config(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config.config(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if !running_clone.load(Ordering::Relaxed) {
+                    return;
+                }
 
-                    if channels == 1 {
-                        engine_clone.extend_samples(data.iter().copied());
-                    } else {
-                        engine_clone.extend_samples(data.iter().step_by(channels).copied());
-                    }
-                },
-                |err| {
-                    eprintln!("Stream error: {}", err);
-                },
-                None,
-            )
-        }
-        cpal::SampleFormat::I16 => {
-            device.build_input_stream(
-                &config.config(),
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
+                if channels == 1 {
+                    engine_clone.extend_samples(data.iter().copied());
+                } else {
+                    engine_clone.extend_samples(data.iter().step_by(channels).copied());
+                }
+            },
+            |err| {
+                eprintln!("Stream error: {}", err);
+            },
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config.config(),
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                if !running_clone.load(Ordering::Relaxed) {
+                    return;
+                }
 
-                    let converter = |&v: &i16| v as f32 / 32768.0;
-                    if channels == 1 {
-                        engine_clone.extend_samples(data.iter().map(converter));
-                    } else {
-                        engine_clone.extend_samples(data.iter().step_by(channels).map(converter));
-                    }
-                },
-                |err| {
-                    eprintln!("Stream error: {}", err);
-                },
-                None,
-            )
-        }
-        cpal::SampleFormat::U16 => {
-            device.build_input_stream(
-                &config.config(),
-                move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
+                let converter = |&v: &i16| v as f32 / 32768.0;
+                if channels == 1 {
+                    engine_clone.extend_samples(data.iter().map(converter));
+                } else {
+                    engine_clone.extend_samples(data.iter().step_by(channels).map(converter));
+                }
+            },
+            |err| {
+                eprintln!("Stream error: {}", err);
+            },
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config.config(),
+            move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                if !running_clone.load(Ordering::Relaxed) {
+                    return;
+                }
 
-                    let converter = |&v: &u16| (v as f32 - 32768.0) / 32768.0;
-                    if channels == 1 {
-                        engine_clone.extend_samples(data.iter().map(converter));
-                    } else {
-                        engine_clone.extend_samples(data.iter().step_by(channels).map(converter));
-                    }
-                },
-                |err| {
-                    eprintln!("Stream error: {}", err);
-                },
-                None,
-            )
-        }
+                let converter = |&v: &u16| (v as f32 - 32768.0) / 32768.0;
+                if channels == 1 {
+                    engine_clone.extend_samples(data.iter().map(converter));
+                } else {
+                    engine_clone.extend_samples(data.iter().step_by(channels).map(converter));
+                }
+            },
+            |err| {
+                eprintln!("Stream error: {}", err);
+            },
+            None,
+        ),
         _ => {
-            let _ = tx.send(TranscriptionEvent::Error("Unsupported audio sample format".to_string()));
+            let _ = tx.send(TranscriptionEvent::Error(
+                "Unsupported audio sample format".to_string(),
+            ));
             return;
         }
     };
@@ -1336,7 +1352,10 @@ fn run_audio_capture(
     match stream_result {
         Ok(stream) => {
             if let Err(e) = stream.play() {
-                let _ = tx.send(TranscriptionEvent::Error(format!("Failed to play stream: {}", e)));
+                let _ = tx.send(TranscriptionEvent::Error(format!(
+                    "Failed to play stream: {}",
+                    e
+                )));
                 return;
             }
 
@@ -1375,13 +1394,15 @@ fn run_audio_capture(
                         is_speaking = false;
 
                         if !samples_to_process.is_empty() {
-                            let resampled = resample_linear(&samples_to_process, sample_rate as u32, 16000);
+                            let resampled =
+                                resample_linear(&samples_to_process, sample_rate as u32, 16000);
                             if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
                                 let clean_text = clean_transcription(&text);
                                 if !clean_text.is_empty() {
                                     let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
                                 } else {
-                                    let _ = tx.send(TranscriptionEvent::PartialResult("".to_string()));
+                                    let _ =
+                                        tx.send(TranscriptionEvent::PartialResult("".to_string()));
                                 }
                             }
                         }
@@ -1403,7 +1424,10 @@ fn run_audio_capture(
             }
         }
         Err(e) => {
-            let _ = tx.send(TranscriptionEvent::Error(format!("Failed to build stream: {}", e)));
+            let _ = tx.send(TranscriptionEvent::Error(format!(
+                "Failed to build stream: {}",
+                e
+            )));
         }
     }
 }
