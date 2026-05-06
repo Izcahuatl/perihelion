@@ -634,7 +634,7 @@ impl Default for PerihelionApp {
     fn default() -> Self {
         let model_dir = Self::model_dir();
         let model_exists = Self::check_model_exists(&model_dir);
-        let osc_socket = UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
+        let osc_socket = UdpSocket::bind("127.0.0.1:0").ok().and_then(|s| {
             s.connect("127.0.0.1:9000").ok().map(|_| s)
         });
         let available_devices = Self::get_available_devices();
@@ -1174,7 +1174,7 @@ fn extract_perihelion_value(packet: &rosc::OscPacket) -> Option<bool> {
 }
 
 fn run_osc_listener(tx: Sender<bool>) {
-    let socket = match UdpSocket::bind("0.0.0.0:9001") {
+    let socket = match UdpSocket::bind("127.0.0.1:9001") {
         Ok(s) => s,
         Err(_) => return,
     };
