@@ -43,7 +43,6 @@ enum InitEvent {
 
 #[derive(Debug, Clone)]
 enum TranscriptionEvent {
-    PartialResult(String),
     FinalResult(String),
     Error(String),
 }
@@ -96,11 +95,21 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
 }
 
 fn clean_transcription(text: &str) -> String {
-    let mut result = text.to_string();
-    for tag in STRIP_TAGS {
-        if result.contains(tag) {
-            result = result.replace(tag, "");
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' && bytes.get(i + 1) == Some(&b'|') {
+            if let Some(end) = text[i..].find("|>") {
+                let tag = &text[i..i + end + 2];
+                if STRIP_TAGS.contains(&tag) {
+                    i += end + 2;
+                    continue;
+                }
+            }
         }
+        result.push(bytes[i] as char);
+        i += 1;
     }
     result.trim().to_string()
 }
@@ -115,7 +124,7 @@ impl AsrEngine {
         let recognizer = build_recognizer(model_dir, settings)?;
         Ok(Self {
             recognizer,
-            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            audio_buffer: Arc::new(Mutex::new(Vec::with_capacity(16000 * 30))),
         })
     }
 
@@ -138,7 +147,9 @@ impl AsrEngine {
 
     pub fn clear_buffer(&self) -> Vec<f32> {
         let mut buffer = self.audio_buffer.lock().unwrap();
-        std::mem::take(&mut *buffer)
+        let taken = std::mem::take(&mut *buffer);
+        buffer.reserve(16000 * 30);
+        taken
     }
 
     pub fn transcribe_samples(&self, sample_rate: i32, samples: &[f32]) -> anyhow::Result<String> {
@@ -268,7 +279,6 @@ pub struct PerihelionApp {
     osc_rx: Option<Receiver<bool>>,
     transcription_rx: Option<Receiver<TranscriptionEvent>>,
     recognized_text: String,
-    partial_text: String,
     is_listening: bool,
     status_message: String,
     settings: Settings,
@@ -469,22 +479,23 @@ impl PerihelionApp {
         }
     }
 
-    fn ensure_osc_listener(&mut self) {
+    fn ensure_osc_listener(&mut self, ctx: &egui::Context) {
         if self.settings.listening_mode == ListeningMode::ToggleOsc && self.osc_rx.is_none() {
             let (tx, rx) = channel();
             self.osc_rx = Some(rx);
-            thread::spawn(move || run_osc_listener(tx));
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || run_osc_listener(tx, ctx_clone));
         }
         if self.settings.listening_mode != ListeningMode::ToggleOsc {
             self.osc_rx = None;
         }
     }
 
-    fn handle_osc_events(&mut self) {
+    fn handle_osc_events(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.osc_rx else { return };
         let events: Vec<bool> = rx.try_iter().collect();
         for on in events {
-            self.set_listening(on);
+            self.set_listening(on, ctx);
             self.status_message = if on {
                 "OSC: On".to_string()
             } else {
@@ -498,12 +509,8 @@ impl PerihelionApp {
         let events: Vec<TranscriptionEvent> = rx.try_iter().collect();
         for event in events {
             match event {
-                TranscriptionEvent::PartialResult(text) => {
-                    self.partial_text = text;
-                }
                 TranscriptionEvent::FinalResult(text) => {
                     self.append_text(&text);
-                    self.partial_text.clear();
                 }
                 TranscriptionEvent::Error(e) => {
                     self.status_message = format!("Transcription error: {}", e);
@@ -512,7 +519,7 @@ impl PerihelionApp {
         }
     }
 
-    fn start_audio_capture(&mut self) {
+    fn start_audio_capture(&mut self, ctx: &egui::Context) {
         if self.engine.is_none() {
             self.status_message = "Engine not ready".to_string();
             return;
@@ -524,9 +531,10 @@ impl PerihelionApp {
         self.audio_running = Arc::new(AtomicBool::new(true));
         let running = self.audio_running.clone();
         let device_index = self.selected_device;
+        let ctx_clone = ctx.clone();
 
         thread::spawn(move || {
-            run_audio_capture(tx, engine, running, device_index);
+            run_audio_capture(tx, engine, running, device_index, ctx_clone);
         });
     }
 
@@ -535,11 +543,11 @@ impl PerihelionApp {
         self.transcription_rx = None;
     }
 
-    fn sync_listening_state(&mut self) {
+    fn sync_listening_state(&mut self, ctx: &egui::Context) {
         match self.settings.listening_mode {
             ListeningMode::AlwaysOn => {
                 if !self.is_listening {
-                    self.set_listening(true);
+                    self.set_listening(true, ctx);
                     self.status_message = "Always On".to_string();
                 }
             }
@@ -559,10 +567,14 @@ impl PerihelionApp {
     }
 
     fn append_text(&mut self, text: &str) {
-        if self.settings.append_mode && !self.recognized_text.is_empty() {
-            self.recognized_text.push('\n');
+        if self.settings.append_mode {
+            if !self.recognized_text.is_empty() {
+                self.recognized_text.push('\n');
+            }
+            self.recognized_text.push_str(text);
+        } else {
+            self.recognized_text = text.to_string();
         }
-        self.recognized_text.push_str(text);
         if !text.is_empty() {
             self.send_osc_chatbox(text);
         }
@@ -577,11 +589,11 @@ impl PerihelionApp {
         self.status_message = "Cleared".to_string();
     }
 
-    fn set_listening(&mut self, listening: bool) {
+    fn set_listening(&mut self, listening: bool, ctx: &egui::Context) {
         if self.is_listening != listening {
             self.is_listening = listening;
             if listening {
-                self.start_audio_capture();
+                self.start_audio_capture(ctx);
             } else {
                 self.stop_audio_capture();
             }
@@ -602,9 +614,13 @@ impl PerihelionApp {
     }
 
     fn send_osc_chatbox(&self, text: &str) {
-        let truncated: String = text.chars().take(140).collect();
+        let msg = if text.len() > 140 && text.chars().count() > 140 {
+            text.chars().take(140).collect::<String>()
+        } else {
+            text.to_string()
+        };
         self.send_osc_message("/chatbox/input", vec![
-            rosc::OscType::String(truncated),
+            rosc::OscType::String(msg),
             rosc::OscType::Bool(true),
         ]);
     }
@@ -613,13 +629,13 @@ impl PerihelionApp {
         self.send_osc_message("/chatbox/typing", vec![rosc::OscType::Bool(typing)]);
     }
 
-    fn start_listening(&mut self) {
-        self.set_listening(true);
+    fn start_listening(&mut self, ctx: &egui::Context) {
+        self.set_listening(true, ctx);
         self.status_message = "Listening...".to_string();
     }
 
-    fn stop_listening(&mut self) {
-        self.set_listening(false);
+    fn stop_listening(&mut self, ctx: &egui::Context) {
+        self.set_listening(false, ctx);
         self.status_message = "Ready".to_string();
     }
 }
@@ -658,7 +674,6 @@ impl Default for PerihelionApp {
             osc_rx: None,
             transcription_rx: None,
             recognized_text: String::new(),
-            partial_text: String::new(),
             is_listening: false,
             status_message: "Ready".to_string(),
             settings,
@@ -686,9 +701,9 @@ impl eframe::App for PerihelionApp {
         self.handle_download_events();
         self.handle_init_events();
         self.handle_transcription_events();
-        self.ensure_osc_listener();
-        self.handle_osc_events();
-        self.sync_listening_state();
+        self.ensure_osc_listener(ctx);
+        self.handle_osc_events(ctx);
+        self.sync_listening_state(ctx);
 
         if matches!(self.model_status, ModelStatus::Downloading { .. } | ModelStatus::Initializing) || self.is_listening {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -865,9 +880,9 @@ impl eframe::App for PerihelionApp {
                     let response = ui.add_sized([avail, 40.0], button);
                     if can_click && response.clicked() {
                         if self.is_listening {
-                            self.stop_listening();
+                            self.stop_listening(ctx);
                         } else {
-                            self.start_listening();
+                            self.start_listening(ctx);
                         }
                     }
 
@@ -889,15 +904,9 @@ impl eframe::App for PerihelionApp {
                     });
 
                     egui::ScrollArea::vertical().max_height(70.0).show(ui, |ui| {
-                        let mut text_display = if self.is_listening && !self.partial_text.is_empty() {
-                            format!("{}\n{}", self.recognized_text, self.partial_text)
-                        } else {
-                            self.recognized_text.clone()
-                        };
-
                         ui.add_sized(
                             [avail, 52.0],
-                            egui::TextEdit::multiline(&mut text_display)
+                            egui::TextEdit::multiline(&mut self.recognized_text.as_str())
                                 .font(egui::TextStyle::Monospace)
                                 .interactive(false),
                         );
@@ -1044,6 +1053,7 @@ impl eframe::App for PerihelionApp {
                             ui.label("If the model's fucked, you can delete it to reinstall it.");
                             ui.add_space(4.0);
                             if ui.button(egui::RichText::new("Annihilate Model").size(16.0).color(egui::Color32::RED)).clicked() {
+                                self.set_listening(false, ctx);
                                 let _ = std::fs::remove_dir_all(&self.model_dir);
                                 self.engine = None;
                                 self.model_status = ModelStatus::NotDownloaded;
@@ -1127,7 +1137,10 @@ fn download_file_with_progress(
     let mut response = reqwest::blocking::get(url)
         .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
     let total_size = response.content_length().unwrap_or(0);
-    let mut file = BufWriter::new(std::fs::File::create(dest)?);
+    // Write to a .part file first — if we crash mid-download, the incomplete file
+    // won't be mistaken for a valid model file on next launch
+    let tmp_dest = dest.with_extension("part");
+    let mut file = BufWriter::new(std::fs::File::create(&tmp_dest)?);
     let mut buffer = [0u8; 65536];
     let mut downloaded: u64 = 0;
     let mut last_reported: u64 = 0;
@@ -1146,6 +1159,9 @@ fn download_file_with_progress(
             });
         }
     }
+    file.flush()?;
+    drop(file);
+    std::fs::rename(&tmp_dest, dest)?;
     Ok(())
 }
 
@@ -1173,7 +1189,7 @@ fn extract_perihelion_value(packet: &rosc::OscPacket) -> Option<bool> {
     }
 }
 
-fn run_osc_listener(tx: Sender<bool>) {
+fn run_osc_listener(tx: Sender<bool>, ctx: egui::Context) {
     let socket = match UdpSocket::bind("0.0.0.0:9001") {
         Ok(s) => s,
         Err(_) => return,
@@ -1187,6 +1203,7 @@ fn run_osc_listener(tx: Sender<bool>) {
                         if tx.send(on).is_err() {
                             break;
                         }
+                        ctx.request_repaint();
                     }
                 }
             }
@@ -1199,17 +1216,36 @@ fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     if in_rate == out_rate {
         return input.to_vec();
     }
+
+    // Anti-aliasing: apply a simple moving-average low-pass filter before downsampling
+    // to reduce aliasing artifacts on sibilants and high-frequency phonemes
+    let filtered;
+    let src = if in_rate > out_rate {
+        let factor = (in_rate / out_rate) as usize;
+        if factor > 1 && input.len() >= factor {
+            filtered = input
+                .windows(factor)
+                .map(|w| w.iter().sum::<f32>() / factor as f32)
+                .collect::<Vec<_>>();
+            &filtered
+        } else {
+            input
+        }
+    } else {
+        input
+    };
+
     let ratio = in_rate as f64 / out_rate as f64;
-    let out_len = (input.len() as f64 / ratio).floor() as usize;
+    let out_len = (src.len() as f64 / ratio).ceil() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let in_pos = i as f64 * ratio;
         let idx = in_pos.floor() as usize;
         let frac = (in_pos - idx as f64) as f32;
-        if idx + 1 < input.len() {
-            out.push(input[idx] * (1.0 - frac) + input[idx + 1] * frac);
-        } else if idx < input.len() {
-            out.push(input[idx]);
+        if idx + 1 < src.len() {
+            out.push(src[idx] * (1.0 - frac) + src[idx + 1] * frac);
+        } else if idx < src.len() {
+            out.push(src[idx]);
         }
     }
     out
@@ -1220,6 +1256,7 @@ fn run_audio_capture(
     engine: Arc<AsrEngine>,
     running: Arc<AtomicBool>,
     device_index: usize,
+    ctx: egui::Context,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -1231,6 +1268,7 @@ fn run_audio_capture(
             Ok(iter) => iter,
             Err(e) => {
                 let _ = tx.send(TranscriptionEvent::Error(format!("Failed to get devices: {}", e)));
+                ctx.request_repaint();
                 return;
             }
         };
@@ -1239,6 +1277,7 @@ fn run_audio_capture(
             Some(d) => d,
             None => {
                 let _ = tx.send(TranscriptionEvent::Error("Selected device not found".to_string()));
+                ctx.request_repaint();
                 return;
             }
         }
@@ -1248,87 +1287,46 @@ fn run_audio_capture(
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(TranscriptionEvent::Error(format!("Failed to get config: {}", e)));
+            ctx.request_repaint();
             return;
         }
     };
 
     let sample_rate = config.sample_rate() as i32;
     let channels = config.channels() as usize;
-    // Process every 0.5 seconds of audio (or adapt based on sample rate)
-    let chunk_size = ((sample_rate as usize) / 2).max(4096);
-
-    // Create stream
-    let engine_clone = engine.clone();
-    let running_clone = running.clone();
+    // Process every 0.1 seconds of audio
+    let chunk_size = ((sample_rate as usize) / 10).max(1024);
 
     // Clear buffer from previous runs before starting capture
-    engine_clone.clear_buffer();
+    engine.clear_buffer();
+
+    macro_rules! build_stream {
+        ($device:expr, $config:expr, $running:expr, $engine:expr, $ch:expr, $ty:ty, $convert:expr) => {{
+            let running = $running.clone();
+            let engine = $engine.clone();
+            $device.build_input_stream(
+                &$config.config(),
+                move |data: &[$ty], _: &cpal::InputCallbackInfo| {
+                    if !running.load(Ordering::Relaxed) { return; }
+                    if $ch == 1 {
+                        engine.extend_samples(data.iter().map($convert));
+                    } else {
+                        engine.extend_samples(data.iter().step_by($ch).map($convert));
+                    }
+                },
+                |err| eprintln!("Stream error: {}", err),
+                None,
+            )
+        }};
+    }
 
     let stream_result = match config.sample_format() {
-        cpal::SampleFormat::F32 => {
-            device.build_input_stream(
-                &config.config(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    if channels == 1 {
-                        engine_clone.extend_samples(data.iter().copied());
-                    } else {
-                        engine_clone.extend_samples(data.iter().step_by(channels).copied());
-                    }
-                },
-                |err| {
-                    eprintln!("Stream error: {}", err);
-                },
-                None,
-            )
-        }
-        cpal::SampleFormat::I16 => {
-            device.build_input_stream(
-                &config.config(),
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    let converter = |&v: &i16| v as f32 / 32768.0;
-                    if channels == 1 {
-                        engine_clone.extend_samples(data.iter().map(converter));
-                    } else {
-                        engine_clone.extend_samples(data.iter().step_by(channels).map(converter));
-                    }
-                },
-                |err| {
-                    eprintln!("Stream error: {}", err);
-                },
-                None,
-            )
-        }
-        cpal::SampleFormat::U16 => {
-            device.build_input_stream(
-                &config.config(),
-                move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    let converter = |&v: &u16| (v as f32 - 32768.0) / 32768.0;
-                    if channels == 1 {
-                        engine_clone.extend_samples(data.iter().map(converter));
-                    } else {
-                        engine_clone.extend_samples(data.iter().step_by(channels).map(converter));
-                    }
-                },
-                |err| {
-                    eprintln!("Stream error: {}", err);
-                },
-                None,
-            )
-        }
+        cpal::SampleFormat::F32 => build_stream!(device, config, running, engine, channels, f32, |&v: &f32| v),
+        cpal::SampleFormat::I16 => build_stream!(device, config, running, engine, channels, i16, |&v: &i16| v as f32 / 32768.0),
+        cpal::SampleFormat::U16 => build_stream!(device, config, running, engine, channels, u16, |&v: &u16| (v as f32 - 32768.0) / 32768.0),
         _ => {
             let _ = tx.send(TranscriptionEvent::Error("Unsupported audio sample format".to_string()));
+            ctx.request_repaint();
             return;
         }
     };
@@ -1337,6 +1335,7 @@ fn run_audio_capture(
         Ok(stream) => {
             if let Err(e) = stream.play() {
                 let _ = tx.send(TranscriptionEvent::Error(format!("Failed to play stream: {}", e)));
+                ctx.request_repaint();
                 return;
             }
 
@@ -1346,7 +1345,7 @@ fn run_audio_capture(
 
             // Keep the stream alive while running
             while running.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(100));
 
                 if let Some((rms, total_len)) = engine.check_new_audio(last_len, chunk_size) {
                     last_len = total_len;
@@ -1367,8 +1366,8 @@ fn run_audio_capture(
                         continue;
                     }
 
-                    // If user stopped speaking (1.5 seconds of silence = 3 chunks)
-                    if silence_chunks >= 3 {
+                    // If user stopped speaking (0.6 seconds of silence = 6 chunks)
+                    if silence_chunks >= 6 {
                         let samples_to_process = engine.clear_buffer();
                         last_len = 0;
                         silence_chunks = 0;
@@ -1380,8 +1379,7 @@ fn run_audio_capture(
                                 let clean_text = clean_transcription(&text);
                                 if !clean_text.is_empty() {
                                     let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
-                                } else {
-                                    let _ = tx.send(TranscriptionEvent::PartialResult("".to_string()));
+                                    ctx.request_repaint();
                                 }
                             }
                         }
@@ -1398,12 +1396,14 @@ fn run_audio_capture(
                     let clean_text = clean_transcription(&text);
                     if !clean_text.is_empty() {
                         let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
+                        ctx.request_repaint();
                     }
                 }
             }
         }
         Err(e) => {
             let _ = tx.send(TranscriptionEvent::Error(format!("Failed to build stream: {}", e)));
+            ctx.request_repaint();
         }
     }
 }
