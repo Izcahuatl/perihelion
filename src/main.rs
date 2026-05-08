@@ -101,9 +101,10 @@ fn clean_transcription(text: &str) -> String {
     // Slow path: allocate once, strip in-place
     let mut result = text.to_string();
     for tag in STRIP_TAGS {
-        // Skip the contains() check — replace() on a miss is already O(n) with no alloc
-        // But we already know at least one tag is present
-        result = result.replace(tag, "");
+        // ⚡ Bolt: Check contains() before replace() since replace() ALWAYS allocates in Rust
+        if result.contains(tag) {
+            result = result.replace(tag, "");
+        }
     }
 
     // Some Qwen ASR models hallucinate Chinese text or common short phrases on pure noise.
