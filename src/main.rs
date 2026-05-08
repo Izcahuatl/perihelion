@@ -1,26 +1,28 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use parking_lot::Mutex;
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineQwen3ASRModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
     Wave,
 };
+use std::borrow::Cow;
 use std::io::{BufWriter, Read, Write};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
-const MODEL_REPO: &str = "pantinor/sherpa-onnx-qwen3-asr-0.6b-int8";
+const MODEL_REPO: &str = "ilmina/eng";
 
 const MODEL_FILES: &[&str] = &[
-    "conv_frontend.onnx",
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "tokenizer/merges.txt",
-    "tokenizer/tokenizer_config.json",
-    "tokenizer/vocab.json",
+    "encoder_model.ort",
+    "decoder_model_merged.ort",
+    "tokens.txt",
 ];
 
 const STRIP_TAGS: &[&str] = &[
@@ -30,7 +32,7 @@ const STRIP_TAGS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 enum DownloadEvent {
-    Progress { file: String, bytes: u64, total: u64 },
+    Progress { file: Arc<str>, bytes: u64, total: u64 },
     FileDone(String),
     Error(String),
     AllDone,
@@ -69,21 +71,12 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
     config.hotwords_score = settings.hotwords_boost;
 
     config.model_config = OfflineModelConfig {
-        qwen3_asr: OfflineQwen3ASRModelConfig {
-            conv_frontend: Some(
-                model_dir.join("conv_frontend.onnx").to_string_lossy().into_owned(),
-            ),
-            encoder: Some(
-                model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned(),
-            ),
-            decoder: Some(
-                model_dir.join("decoder.int8.onnx").to_string_lossy().into_owned(),
-            ),
-            tokenizer: Some(
-                model_dir.join("tokenizer").to_string_lossy().into_owned(),
-            ),
+        moonshine: sherpa_onnx::OfflineMoonshineModelConfig {
+            encoder: Some(model_dir.join("encoder_model.ort").to_string_lossy().into_owned()),
+            merged_decoder: Some(model_dir.join("decoder_model_merged.ort").to_string_lossy().into_owned()),
             ..Default::default()
         },
+        tokens: Some(model_dir.join("tokens.txt").to_string_lossy().into_owned()),
         num_threads: settings.num_threads,
         provider: Some(settings.provider.as_config_str().to_string()),
         debug: false,
@@ -95,23 +88,31 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
 }
 
 fn clean_transcription(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'<' && bytes.get(i + 1) == Some(&b'|') {
-            if let Some(end) = text[i..].find("|>") {
-                let tag = &text[i..i + end + 2];
-                if STRIP_TAGS.contains(&tag) {
-                    i += end + 2;
-                    continue;
-                }
-            }
+    // Fast path: if no tags present, just trim (avoids any allocation from replace)
+    let needs_cleaning = STRIP_TAGS.iter().any(|tag| text.contains(tag));
+    if !needs_cleaning {
+        let trimmed = text.trim();
+        if trimmed.len() == text.len() {
+            return text.to_string();
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        return trimmed.to_string();
     }
-    result.trim().to_string()
+
+    // Slow path: allocate once, strip in-place
+    let mut result = text.to_string();
+    for tag in STRIP_TAGS {
+        // Skip the contains() check — replace() on a miss is already O(n) with no alloc
+        // But we already know at least one tag is present
+        result = result.replace(tag, "");
+    }
+
+    // Some Qwen ASR models hallucinate Chinese text or common short phrases on pure noise.
+    let trimmed = result.trim();
+    if trimmed.len() == result.len() {
+        result
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub struct AsrEngine {
@@ -129,24 +130,35 @@ impl AsrEngine {
     }
 
     pub fn extend_samples<I: IntoIterator<Item = f32>>(&self, iter: I) {
-        let mut buffer = self.audio_buffer.lock().unwrap();
+        let mut buffer = self.audio_buffer.lock();
         buffer.extend(iter);
     }
 
-    // I'm so fucking scared brah
     pub fn check_new_audio(&self, since: usize, min_total: usize) -> Option<(f32, usize)> {
-        let buffer = self.audio_buffer.lock().unwrap();
+        let buffer = self.audio_buffer.lock();
         if buffer.len() < min_total || buffer.len() <= since {
             return None;
         }
         let new_samples = &buffer[since..];
-        let sum_sq: f32 = new_samples.iter().map(|s| s * s).sum();
+        // Use chunks_exact to help LLVM auto-vectorize the sum-of-squares
+        let mut sum_sq: f32 = 0.0;
+        let chunks = new_samples.chunks_exact(4);
+        let remainder = chunks.remainder();
+        for chunk in chunks {
+            sum_sq += chunk[0] * chunk[0]
+                    + chunk[1] * chunk[1]
+                    + chunk[2] * chunk[2]
+                    + chunk[3] * chunk[3];
+        }
+        for &s in remainder {
+            sum_sq += s * s;
+        }
         let rms = (sum_sq / new_samples.len() as f32).sqrt();
         Some((rms, buffer.len()))
     }
 
     pub fn clear_buffer(&self) -> Vec<f32> {
-        let mut buffer = self.audio_buffer.lock().unwrap();
+        let mut buffer = self.audio_buffer.lock();
         let taken = std::mem::take(&mut *buffer);
         buffer.reserve(16000 * 30);
         taken
@@ -248,14 +260,22 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ModelStatus {
     NotDownloaded,
-    Downloading { current_file: String, current_bytes: u64, total_bytes: u64 },
+    Downloading { current_file: Arc<str>, current_bytes: u64, total_bytes: u64 },
     Initializing,
     Ready,
     Error(String),
 }
+
+impl PartialEq for ModelStatus {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+impl Eq for ModelStatus {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -280,7 +300,7 @@ pub struct PerihelionApp {
     transcription_rx: Option<Receiver<TranscriptionEvent>>,
     recognized_text: String,
     is_listening: bool,
-    status_message: String,
+    status_message: Cow<'static, str>,
     settings: Settings,
     test_file_path: String,
     engine: Option<Arc<AsrEngine>>,
@@ -297,7 +317,7 @@ impl PerihelionApp {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("perihelion")
             .join("models")
-            .join("qwen3-asr-0.6b-int8")
+            .join("moonshine-english")
     }
 
     fn config_path() -> PathBuf {
@@ -372,7 +392,7 @@ impl PerihelionApp {
 
     fn start_download(&mut self) {
         self.model_status = ModelStatus::Downloading {
-            current_file: MODEL_FILES[0].to_string(),
+            current_file: Arc::from(MODEL_FILES[0]),
             current_bytes: 0,
             total_bytes: 0,
         };
@@ -383,7 +403,6 @@ impl PerihelionApp {
 
         thread::spawn(move || {
             std::fs::create_dir_all(&model_dir).ok();
-            std::fs::create_dir_all(model_dir.join("tokenizer")).ok();
             for file in &files {
                 let url = format!(
                     "https://huggingface.co/{}/resolve/main/{}",
@@ -394,7 +413,8 @@ impl PerihelionApp {
                     let _ = tx.send(DownloadEvent::FileDone(file.clone()));
                     continue;
                 }
-                if let Err(e) = download_file_with_progress(&url, &dest, &tx, file) {
+                let file_arc: Arc<str> = Arc::from(file.as_str());
+                if let Err(e) = download_file_with_progress(&url, &dest, &tx, &file_arc) {
                     let _ = tx.send(DownloadEvent::Error(format!("{}: {}", file, e)));
                     return;
                 }
@@ -406,7 +426,7 @@ impl PerihelionApp {
 
     fn start_init_engine(&mut self) {
         self.model_status = ModelStatus::Initializing;
-        self.status_message = "Initializing...".to_string();
+        self.status_message = Cow::Borrowed("Initializing...");
         let (tx, rx) = channel();
         self.init_rx = Some(rx);
         let model_dir = self.model_dir.clone();
@@ -439,11 +459,11 @@ impl PerihelionApp {
                 InitEvent::Success(engine) => {
                     self.engine = Some(engine);
                     self.model_status = ModelStatus::Ready;
-                    self.status_message = "Ready".to_string();
+                    self.status_message = Cow::Borrowed("Ready");
                 }
                 InitEvent::Error(e) => {
                     self.model_status = ModelStatus::Error(e);
-                    self.status_message = "Initialization failed".to_string();
+                    self.status_message = Cow::Borrowed("Initialization failed");
                 }
             }
             self.init_rx = None;
@@ -451,9 +471,8 @@ impl PerihelionApp {
     }
 
     fn handle_download_events(&mut self) {
-        let Some(rx) = &self.download_rx else { return };
-        let events: Vec<DownloadEvent> = rx.try_iter().collect();
-        for event in events {
+        let Some(rx) = self.download_rx.take() else { return };
+        while let Ok(event) = rx.try_recv() {
             match event {
                 DownloadEvent::Progress {
                     file,
@@ -467,16 +486,19 @@ impl PerihelionApp {
                     };
                 }
                 DownloadEvent::FileDone(file) => {
-                    self.status_message = format!("Downloaded: {}", file);
+                    self.status_message = Cow::Owned(format!("Downloaded: {}", file));
                 }
                 DownloadEvent::Error(e) => {
                     self.model_status = ModelStatus::Error(e);
                 }
                 DownloadEvent::AllDone => {
+                    // Don't put rx back — download is complete
                     self.start_init_engine();
+                    return;
                 }
             }
         }
+        self.download_rx = Some(rx);
     }
 
     fn ensure_osc_listener(&mut self, ctx: &egui::Context) {
@@ -492,36 +514,32 @@ impl PerihelionApp {
     }
 
     fn handle_osc_events(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.osc_rx else { return };
-        let events: Vec<bool> = rx.try_iter().collect();
-        for on in events {
+        let Some(rx) = self.osc_rx.take() else { return };
+        while let Ok(on) = rx.try_recv() {
             self.set_listening(on, ctx);
-            self.status_message = if on {
-                "OSC: On".to_string()
-            } else {
-                "OSC: Off".to_string()
-            };
+            self.status_message = Cow::Borrowed(if on { "OSC: On" } else { "OSC: Off" });
         }
+        self.osc_rx = Some(rx);
     }
 
     fn handle_transcription_events(&mut self) {
-        let Some(rx) = &self.transcription_rx else { return };
-        let events: Vec<TranscriptionEvent> = rx.try_iter().collect();
-        for event in events {
+        let Some(rx) = self.transcription_rx.take() else { return };
+        while let Ok(event) = rx.try_recv() {
             match event {
                 TranscriptionEvent::FinalResult(text) => {
                     self.append_text(&text);
                 }
                 TranscriptionEvent::Error(e) => {
-                    self.status_message = format!("Transcription error: {}", e);
+                    self.status_message = Cow::Owned(format!("Transcription error: {}", e));
                 }
             }
         }
+        self.transcription_rx = Some(rx);
     }
 
     fn start_audio_capture(&mut self, ctx: &egui::Context) {
         if self.engine.is_none() {
-            self.status_message = "Engine not ready".to_string();
+            self.status_message = Cow::Borrowed("Engine not ready");
             return;
         }
 
@@ -548,7 +566,7 @@ impl PerihelionApp {
             ListeningMode::AlwaysOn => {
                 if !self.is_listening {
                     self.set_listening(true, ctx);
-                    self.status_message = "Always On".to_string();
+                    self.status_message = Cow::Borrowed("Always On");
                 }
             }
             ListeningMode::ToggleButton => {
@@ -580,13 +598,13 @@ impl PerihelionApp {
         }
         if self.settings.auto_copy {
             self.copy_to_clipboard(&self.recognized_text);
-            self.status_message = "Copied".to_string();
+            self.status_message = Cow::Borrowed("Copied");
         }
     }
 
     fn clear_text(&mut self) {
         self.recognized_text.clear();
-        self.status_message = "Cleared".to_string();
+        self.status_message = Cow::Borrowed("Cleared");
     }
 
     fn set_listening(&mut self, listening: bool, ctx: &egui::Context) {
@@ -614,13 +632,14 @@ impl PerihelionApp {
     }
 
     fn send_osc_chatbox(&self, text: &str) {
-        let msg = if text.len() > 140 && text.chars().count() > 140 {
-            text.chars().take(140).collect::<String>()
+        // Avoid allocation for short messages (the common case)
+        let msg: Cow<'_, str> = if text.len() > 140 && text.chars().count() > 140 {
+            Cow::Owned(text.chars().take(140).collect())
         } else {
-            text.to_string()
+            Cow::Borrowed(text)
         };
         self.send_osc_message("/chatbox/input", vec![
-            rosc::OscType::String(msg),
+            rosc::OscType::String(msg.into_owned()),
             rosc::OscType::Bool(true),
         ]);
     }
@@ -631,12 +650,12 @@ impl PerihelionApp {
 
     fn start_listening(&mut self, ctx: &egui::Context) {
         self.set_listening(true, ctx);
-        self.status_message = "Listening...".to_string();
+        self.status_message = Cow::Borrowed("Listening...");
     }
 
     fn stop_listening(&mut self, ctx: &egui::Context) {
         self.set_listening(false, ctx);
-        self.status_message = "Ready".to_string();
+        self.status_message = Cow::Borrowed("Ready");
     }
 }
 
@@ -675,7 +694,7 @@ impl Default for PerihelionApp {
             transcription_rx: None,
             recognized_text: String::new(),
             is_listening: false,
-            status_message: "Ready".to_string(),
+            status_message: Cow::Borrowed("Ready"),
             settings,
             test_file_path: String::new(),
             engine: None,
@@ -894,7 +913,7 @@ impl eframe::App for PerihelionApp {
                             |ui| {
                                 if ui.button("Copy").clicked() {
                                     self.copy_to_clipboard(&self.recognized_text);
-                                    self.status_message = "Copied".to_string();
+                                    self.status_message = Cow::Borrowed("Copied");
                                 }
                                 if ui.button("Clear").clicked() {
                                     self.clear_text();
@@ -914,7 +933,7 @@ impl eframe::App for PerihelionApp {
 
                     // Status
                     ui.horizontal(|ui| {
-                        ui.label(&self.status_message);
+                        ui.label(self.status_message.as_ref());
                         if self.is_listening {
                             ui.spinner();
                         }
@@ -989,7 +1008,7 @@ impl eframe::App for PerihelionApp {
                                 if ui.button("↻ Refresh").clicked() {
                                     self.available_devices = Self::get_available_devices();
                                     self.selected_device = 0;
-                                    self.status_message = "Devices refreshed".to_string();
+                                    self.status_message = Cow::Borrowed("Devices refreshed");
                                 }
                             });
                         });
@@ -1057,7 +1076,7 @@ impl eframe::App for PerihelionApp {
                                 let _ = std::fs::remove_dir_all(&self.model_dir);
                                 self.engine = None;
                                 self.model_status = ModelStatus::NotDownloaded;
-                                self.status_message = "Model files gone".to_string();
+                                self.status_message = Cow::Borrowed("Model files gone");
                             }
                             ui.add_space(8.0);
                             ui.label("Reset all settings to their factory defaults.");
@@ -1066,7 +1085,7 @@ impl eframe::App for PerihelionApp {
                                 self.settings = Settings::default();
                                 self.selected_device = 0;
                                 self.save_config();
-                                self.status_message = "Config reset".to_string();
+                                self.status_message = Cow::Borrowed("Config reset");
                             }
                         });
                     });
@@ -1089,11 +1108,11 @@ impl eframe::App for PerihelionApp {
                                 match engine.transcribe_file(path) {
                                     Ok(text) => self.append_text(&text),
                                     Err(e) => {
-                                        self.status_message = format!("Error: {}", e);
+                                        self.status_message = Cow::Owned(format!("Error: {}", e));
                                     }
                                 }
                             } else {
-                                self.status_message = "Model not ready".to_string();
+                                self.status_message = Cow::Borrowed("Model not ready");
                             }
                         }
                     });
@@ -1132,11 +1151,16 @@ fn download_file_with_progress(
     url: &str,
     dest: &Path,
     tx: &std::sync::mpsc::Sender<DownloadEvent>,
-    filename: &str,
+    filename: &Arc<str>,
 ) -> anyhow::Result<()> {
-    let mut response = reqwest::blocking::get(url)
+    let response = ureq::get(url).call()
         .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
-    let total_size = response.content_length().unwrap_or(0);
+    let total_size = response
+        .headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     // Write to a .part file first — if we crash mid-download, the incomplete file
     // won't be mistaken for a valid model file on next launch
     let tmp_dest = dest.with_extension("part");
@@ -1144,7 +1168,8 @@ fn download_file_with_progress(
     let mut buffer = [0u8; 65536];
     let mut downloaded: u64 = 0;
     let mut last_reported: u64 = 0;
-    while let Ok(n) = response.read(&mut buffer) {
+    let mut reader = response.into_body().into_reader();
+    while let Ok(n) = reader.read(&mut buffer) {
         if n == 0 {
             break;
         }
@@ -1152,8 +1177,9 @@ fn download_file_with_progress(
         downloaded += n as u64;
         if downloaded - last_reported >= 262_144 || downloaded == total_size {
             last_reported = downloaded;
+            // Arc::clone is O(1) — just an atomic refcount increment
             let _ = tx.send(DownloadEvent::Progress {
-                file: filename.to_string(),
+                file: Arc::clone(filename),
                 bytes: downloaded,
                 total: total_size,
             });
@@ -1217,35 +1243,48 @@ fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
         return input.to_vec();
     }
 
-    // Anti-aliasing: apply a simple moving-average low-pass filter before downsampling
-    // to reduce aliasing artifacts on sibilants and high-frequency phonemes
-    let filtered;
-    let src = if in_rate > out_rate {
+    // For the common 48kHz→16kHz (ratio=3) or 44.1kHz→16kHz case,
+    // fuse the anti-alias filter directly into the interpolation to avoid
+    // allocating an intermediate buffer
+    let ratio = in_rate as f32 / out_rate as f32;
+    if in_rate > out_rate {
         let factor = (in_rate / out_rate) as usize;
         if factor > 1 && input.len() >= factor {
-            filtered = input
-                .windows(factor)
-                .map(|w| w.iter().sum::<f32>() / factor as f32)
-                .collect::<Vec<_>>();
-            &filtered
-        } else {
-            input
-        }
-    } else {
-        input
-    };
+            let inv_factor = 1.0_f32 / factor as f32;
+            let filtered_len = input.len() - factor + 1;
+            let actual_out_len = (filtered_len as f32 / ratio).ceil() as usize;
+            let mut out = Vec::with_capacity(actual_out_len);
 
-    let ratio = in_rate as f64 / out_rate as f64;
-    let out_len = (src.len() as f64 / ratio).ceil() as usize;
+            for i in 0..actual_out_len {
+                let in_pos = i as f32 * ratio;
+                let idx = in_pos as usize; // floor for positive values
+                let frac = in_pos - idx as f32;
+
+                // Inline the moving-average filter for each needed sample
+                if idx + 1 < filtered_len {
+                    let s0: f32 = input[idx..idx + factor].iter().sum::<f32>() * inv_factor;
+                    let s1: f32 = input[idx + 1..idx + 1 + factor].iter().sum::<f32>() * inv_factor;
+                    out.push(s0 * (1.0 - frac) + s1 * frac);
+                } else if idx < filtered_len {
+                    let s0: f32 = input[idx..idx + factor].iter().sum::<f32>() * inv_factor;
+                    out.push(s0);
+                }
+            }
+            return out;
+        }
+    }
+
+    // General case for upsampling or non-integer ratios
+    let out_len = (input.len() as f32 / ratio).ceil() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
-        let in_pos = i as f64 * ratio;
-        let idx = in_pos.floor() as usize;
-        let frac = (in_pos - idx as f64) as f32;
-        if idx + 1 < src.len() {
-            out.push(src[idx] * (1.0 - frac) + src[idx + 1] * frac);
-        } else if idx < src.len() {
-            out.push(src[idx]);
+        let in_pos = i as f32 * ratio;
+        let idx = in_pos as usize;
+        let frac = in_pos - idx as f32;
+        if idx + 1 < input.len() {
+            out.push(input[idx] * (1.0 - frac) + input[idx + 1] * frac);
+        } else if idx < input.len() {
+            out.push(input[idx]);
         }
     }
     out
@@ -1409,12 +1448,22 @@ fn run_audio_capture(
 }
 
 fn load_custom_font(cc: &eframe::CreationContext<'_>) {
-    let font_data = include_bytes!("../font.ttf");
+    let font_data_woff2 = include_bytes!("../assets/font.woff2");
+    let title_font_data_woff2 = include_bytes!("../assets/title.woff2");
+
+    let font_data_ttf = woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(font_data_woff2))
+        .expect("Failed to decode font.woff2 to TTF");
+    let title_font_data_ttf = woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(title_font_data_woff2))
+        .expect("Failed to decode title.woff2 to TTF");
 
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "AraletN".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(font_data)),
+        std::sync::Arc::new(egui::FontData::from_owned(font_data_ttf)),
+    );
+    fonts.font_data.insert(
+        "TitleFont".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(title_font_data_ttf)),
     );
     fonts
         .families
@@ -1426,6 +1475,9 @@ fn load_custom_font(cc: &eframe::CreationContext<'_>) {
         .get_mut(&egui::FontFamily::Monospace)
         .unwrap()
         .insert(0, "AraletN".to_owned());
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("Title".into()), vec!["TitleFont".to_owned()]);
 
     cc.egui_ctx.set_fonts(fonts);
 }
@@ -1455,6 +1507,11 @@ fn setup_custom_style(ctx: &egui::Context) {
     visuals.window_rounding = egui::Rounding::same(12.0);
 
     style.visuals = visuals;
+
+    if let Some(text_style) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
+        text_style.family = egui::FontFamily::Name("Title".into());
+    }
+
     ctx.set_style(style);
 }
 
