@@ -4,17 +4,14 @@ use serde::{Deserialize, Serialize};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use parking_lot::Mutex;
-use sherpa_onnx::{
-    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    Wave,
-};
+use sherpa_onnx::{OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, Wave};
 use std::borrow::Cow;
 use std::io::{BufWriter, Read, Write};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 const MODEL_REPO: &str = "ilmina/eng";
@@ -26,13 +23,17 @@ const MODEL_FILES: &[&str] = &[
 ];
 
 const STRIP_TAGS: &[&str] = &[
-    "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>",
-    "<|de|>", "<|it|>", "<|es|>", "<|ru|>", "<|asr|>", "<|text|>",
+    "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|fr|>", "<|de|>", "<|it|>", "<|es|>", "<|ru|>",
+    "<|asr|>", "<|text|>",
 ];
 
 #[derive(Debug, Clone)]
 enum DownloadEvent {
-    Progress { file: Arc<str>, bytes: u64, total: u64 },
+    Progress {
+        file: Arc<str>,
+        bytes: u64,
+        total: u64,
+    },
     FileDone(String),
     Error(String),
     AllDone,
@@ -72,8 +73,18 @@ fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<Off
 
     config.model_config = OfflineModelConfig {
         moonshine: sherpa_onnx::OfflineMoonshineModelConfig {
-            encoder: Some(model_dir.join("encoder_model.ort").to_string_lossy().into_owned()),
-            merged_decoder: Some(model_dir.join("decoder_model_merged.ort").to_string_lossy().into_owned()),
+            encoder: Some(
+                model_dir
+                    .join("encoder_model.ort")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            merged_decoder: Some(
+                model_dir
+                    .join("decoder_model_merged.ort")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             ..Default::default()
         },
         tokens: Some(model_dir.join("tokens.txt").to_string_lossy().into_owned()),
@@ -146,9 +157,9 @@ impl AsrEngine {
         let remainder = chunks.remainder();
         for chunk in chunks {
             sum_sq += chunk[0] * chunk[0]
-                    + chunk[1] * chunk[1]
-                    + chunk[2] * chunk[2]
-                    + chunk[3] * chunk[3];
+                + chunk[1] * chunk[1]
+                + chunk[2] * chunk[2]
+                + chunk[3] * chunk[3];
         }
         for &s in remainder {
             sum_sq += s * s;
@@ -263,7 +274,11 @@ impl Default for Settings {
 #[derive(Debug, Clone)]
 pub enum ModelStatus {
     NotDownloaded,
-    Downloading { current_file: Arc<str>, current_bytes: u64, total_bytes: u64 },
+    Downloading {
+        current_file: Arc<str>,
+        current_bytes: u64,
+        total_bytes: u64,
+    },
     Initializing,
     Ready,
     Error(String),
@@ -471,14 +486,12 @@ impl PerihelionApp {
     }
 
     fn handle_download_events(&mut self) {
-        let Some(rx) = self.download_rx.take() else { return };
+        let Some(rx) = self.download_rx.take() else {
+            return;
+        };
         while let Ok(event) = rx.try_recv() {
             match event {
-                DownloadEvent::Progress {
-                    file,
-                    bytes,
-                    total,
-                } => {
+                DownloadEvent::Progress { file, bytes, total } => {
                     self.model_status = ModelStatus::Downloading {
                         current_file: file,
                         current_bytes: bytes,
@@ -523,7 +536,9 @@ impl PerihelionApp {
     }
 
     fn handle_transcription_events(&mut self) {
-        let Some(rx) = self.transcription_rx.take() else { return };
+        let Some(rx) = self.transcription_rx.take() else {
+            return;
+        };
         while let Ok(event) = rx.try_recv() {
             match event {
                 TranscriptionEvent::FinalResult(text) => {
@@ -632,16 +647,22 @@ impl PerihelionApp {
     }
 
     fn send_osc_chatbox(&self, text: &str) {
-        // Avoid allocation for short messages (the common case)
-        let msg: Cow<'_, str> = if text.len() > 140 && text.chars().count() > 140 {
-            Cow::Owned(text.chars().take(140).collect())
+        // Avoid allocation completely by slicing at the character boundary
+        let msg: Cow<'_, str> = if text.len() > 140 {
+            match text.char_indices().nth(140) {
+                Some((idx, _)) => Cow::Borrowed(&text[..idx]),
+                None => Cow::Borrowed(text),
+            }
         } else {
             Cow::Borrowed(text)
         };
-        self.send_osc_message("/chatbox/input", vec![
-            rosc::OscType::String(msg.into_owned()),
-            rosc::OscType::Bool(true),
-        ]);
+        self.send_osc_message(
+            "/chatbox/input",
+            vec![
+                rosc::OscType::String(msg.into_owned()),
+                rosc::OscType::Bool(true),
+            ],
+        );
     }
 
     fn send_osc_typing(&self, typing: bool) {
@@ -669,17 +690,16 @@ impl Default for PerihelionApp {
     fn default() -> Self {
         let model_dir = Self::model_dir();
         let model_exists = Self::check_model_exists(&model_dir);
-        let osc_socket = UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
-            s.connect("127.0.0.1:9000").ok().map(|_| s)
-        });
+        let osc_socket = UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| s.connect("127.0.0.1:9000").ok().map(|_| s));
         let available_devices = Self::get_available_devices();
 
         let (settings, selected_device) = match Self::load_config() {
             Some(c) => (c.settings, c.selected_device),
             None => (Settings::default(), 0),
         };
-        let selected_device = selected_device
-            .min(available_devices.len().saturating_sub(1));
+        let selected_device = selected_device.min(available_devices.len().saturating_sub(1));
 
         let mut app = Self {
             view: View::default(),
@@ -724,19 +744,27 @@ impl eframe::App for PerihelionApp {
         self.handle_osc_events(ctx);
         self.sync_listening_state(ctx);
 
-        if matches!(self.model_status, ModelStatus::Downloading { .. } | ModelStatus::Initializing) || self.is_listening {
+        if matches!(
+            self.model_status,
+            ModelStatus::Downloading { .. } | ModelStatus::Initializing
+        ) || self.is_listening
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         if self.model_status == ModelStatus::Initializing {
             egui::CentralPanel::default()
-                .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0)))
+                .frame(
+                    egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0)),
+                )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() / 2.0 - 40.0);
                         ui.add_sized([40.0, 40.0], egui::Spinner::new());
                         ui.add_space(20.0);
-                        ui.heading(egui::RichText::new("Hang on, the model's starting!").size(24.0));
+                        ui.heading(
+                            egui::RichText::new("Hang on, the model's starting!").size(24.0),
+                        );
                     });
                 });
             return;
@@ -746,28 +774,21 @@ impl eframe::App for PerihelionApp {
         egui::SidePanel::left("sidebar")
             .resizable(false)
             .exact_width(100.0)
-            .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::same(6.0)),
-            )
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::same(6.0)))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
                     ui.add_space(4.0);
 
-                    let mut sel =
-                        |ui: &mut egui::Ui, label: &str, view: View| {
-                            let active = self.view == view;
-                            if ui
-                                .add_sized(
-                                    [88.0, 28.0],
-                                    egui::SelectableLabel::new(active, label),
-                                )
-                                .clicked()
-                            {
-                                self.view = view;
-                            }
-                        };
+                    let mut sel = |ui: &mut egui::Ui, label: &str, view: View| {
+                        let active = self.view == view;
+                        if ui
+                            .add_sized([88.0, 28.0], egui::SelectableLabel::new(active, label))
+                            .clicked()
+                        {
+                            self.view = view;
+                        }
+                    };
 
                     sel(ui, "Main", View::Main);
                     sel(ui, "Settings", View::Settings);
@@ -777,8 +798,7 @@ impl eframe::App for PerihelionApp {
             });
 
         // Content
-        let frame = egui::Frame::central_panel(&ctx.style())
-            .inner_margin(egui::Margin::same(20.0));
+        let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0));
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let avail = ui.available_width();
@@ -1153,7 +1173,8 @@ fn download_file_with_progress(
     tx: &std::sync::mpsc::Sender<DownloadEvent>,
     filename: &Arc<str>,
 ) -> anyhow::Result<()> {
-    let response = ureq::get(url).call()
+    let response = ureq::get(url)
+        .call()
         .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
     let total_size = response
         .headers()
@@ -1306,7 +1327,10 @@ fn run_audio_capture(
         let mut device_iter = match host.input_devices() {
             Ok(iter) => iter,
             Err(e) => {
-                let _ = tx.send(TranscriptionEvent::Error(format!("Failed to get devices: {}", e)));
+                let _ = tx.send(TranscriptionEvent::Error(format!(
+                    "Failed to get devices: {}",
+                    e
+                )));
                 ctx.request_repaint();
                 return;
             }
@@ -1315,7 +1339,9 @@ fn run_audio_capture(
         match device_iter.nth(device_index) {
             Some(d) => d,
             None => {
-                let _ = tx.send(TranscriptionEvent::Error("Selected device not found".to_string()));
+                let _ = tx.send(TranscriptionEvent::Error(
+                    "Selected device not found".to_string(),
+                ));
                 ctx.request_repaint();
                 return;
             }
@@ -1325,7 +1351,10 @@ fn run_audio_capture(
     let config = match device.default_input_config() {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(TranscriptionEvent::Error(format!("Failed to get config: {}", e)));
+            let _ = tx.send(TranscriptionEvent::Error(format!(
+                "Failed to get config: {}",
+                e
+            )));
             ctx.request_repaint();
             return;
         }
@@ -1346,7 +1375,9 @@ fn run_audio_capture(
             $device.build_input_stream(
                 &$config.config(),
                 move |data: &[$ty], _: &cpal::InputCallbackInfo| {
-                    if !running.load(Ordering::Relaxed) { return; }
+                    if !running.load(Ordering::Relaxed) {
+                        return;
+                    }
                     if $ch == 1 {
                         engine.extend_samples(data.iter().map($convert));
                     } else {
@@ -1360,11 +1391,31 @@ fn run_audio_capture(
     }
 
     let stream_result = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_stream!(device, config, running, engine, channels, f32, |&v: &f32| v),
-        cpal::SampleFormat::I16 => build_stream!(device, config, running, engine, channels, i16, |&v: &i16| v as f32 / 32768.0),
-        cpal::SampleFormat::U16 => build_stream!(device, config, running, engine, channels, u16, |&v: &u16| (v as f32 - 32768.0) / 32768.0),
+        cpal::SampleFormat::F32 => {
+            build_stream!(device, config, running, engine, channels, f32, |&v: &f32| v)
+        }
+        cpal::SampleFormat::I16 => build_stream!(
+            device,
+            config,
+            running,
+            engine,
+            channels,
+            i16,
+            |&v: &i16| v as f32 / 32768.0
+        ),
+        cpal::SampleFormat::U16 => build_stream!(
+            device,
+            config,
+            running,
+            engine,
+            channels,
+            u16,
+            |&v: &u16| (v as f32 - 32768.0) / 32768.0
+        ),
         _ => {
-            let _ = tx.send(TranscriptionEvent::Error("Unsupported audio sample format".to_string()));
+            let _ = tx.send(TranscriptionEvent::Error(
+                "Unsupported audio sample format".to_string(),
+            ));
             ctx.request_repaint();
             return;
         }
@@ -1373,7 +1424,10 @@ fn run_audio_capture(
     match stream_result {
         Ok(stream) => {
             if let Err(e) = stream.play() {
-                let _ = tx.send(TranscriptionEvent::Error(format!("Failed to play stream: {}", e)));
+                let _ = tx.send(TranscriptionEvent::Error(format!(
+                    "Failed to play stream: {}",
+                    e
+                )));
                 ctx.request_repaint();
                 return;
             }
@@ -1413,7 +1467,8 @@ fn run_audio_capture(
                         is_speaking = false;
 
                         if !samples_to_process.is_empty() {
-                            let resampled = resample_linear(&samples_to_process, sample_rate as u32, 16000);
+                            let resampled =
+                                resample_linear(&samples_to_process, sample_rate as u32, 16000);
                             if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
                                 let clean_text = clean_transcription(&text);
                                 if !clean_text.is_empty() {
@@ -1441,7 +1496,10 @@ fn run_audio_capture(
             }
         }
         Err(e) => {
-            let _ = tx.send(TranscriptionEvent::Error(format!("Failed to build stream: {}", e)));
+            let _ = tx.send(TranscriptionEvent::Error(format!(
+                "Failed to build stream: {}",
+                e
+            )));
             ctx.request_repaint();
         }
     }
@@ -1451,10 +1509,12 @@ fn load_custom_font(cc: &eframe::CreationContext<'_>) {
     let font_data_woff2 = include_bytes!("../assets/font.woff2");
     let title_font_data_woff2 = include_bytes!("../assets/title.woff2");
 
-    let font_data_ttf = woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(font_data_woff2))
-        .expect("Failed to decode font.woff2 to TTF");
-    let title_font_data_ttf = woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(title_font_data_woff2))
-        .expect("Failed to decode title.woff2 to TTF");
+    let font_data_ttf =
+        woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(font_data_woff2))
+            .expect("Failed to decode font.woff2 to TTF");
+    let title_font_data_ttf =
+        woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(title_font_data_woff2))
+            .expect("Failed to decode title.woff2 to TTF");
 
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -1475,9 +1535,10 @@ fn load_custom_font(cc: &eframe::CreationContext<'_>) {
         .get_mut(&egui::FontFamily::Monospace)
         .unwrap()
         .insert(0, "AraletN".to_owned());
-    fonts
-        .families
-        .insert(egui::FontFamily::Name("Title".into()), vec!["TitleFont".to_owned()]);
+    fonts.families.insert(
+        egui::FontFamily::Name("Title".into()),
+        vec!["TitleFont".to_owned()],
+    );
 
     cc.egui_ctx.set_fonts(fonts);
 }
