@@ -7,7 +7,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 
-use crate::config::{AppConfig, ListeningMode, Settings, Provider};
+use crate::config::{AppConfig, ListeningMode, Settings};
 use crate::events::{DownloadEvent, InitEvent, TranscriptionEvent};
 use crate::engine::{AsrEngine, MODEL_FILES, MODEL_REPO};
 use crate::audio::run_audio_capture;
@@ -34,7 +34,6 @@ pub enum View {
     Main,
     Settings,
     Debug,
-    Help,
 }
 
 impl Default for View {
@@ -56,6 +55,7 @@ pub struct PerihelionApp {
     test_file_path: String,
     engine: Option<Arc<AsrEngine>>,
     audio_running: Arc<AtomicBool>,
+    osc_running: Option<Arc<AtomicBool>>,
     model_dir: PathBuf,
     osc_socket: Option<UdpSocket>,
     available_devices: Vec<String>,
@@ -260,10 +260,15 @@ impl PerihelionApp {
             let (tx, rx) = channel();
             self.osc_rx = Some(rx);
             let ctx_clone = ctx.clone();
-            thread::spawn(move || run_osc_listener(tx, ctx_clone));
+            let running = Arc::new(AtomicBool::new(true));
+            self.osc_running = Some(running.clone());
+            thread::spawn(move || run_osc_listener(tx, ctx_clone, running));
         }
         if self.settings.listening_mode != ListeningMode::ToggleOsc {
             self.osc_rx = None;
+            if let Some(running) = self.osc_running.take() {
+                running.store(false, Ordering::Relaxed);
+            }
         }
     }
 
@@ -386,14 +391,12 @@ impl PerihelionApp {
     }
 
     fn send_osc_chatbox(&self, text: &str) {
-        // Avoid allocation for short messages (the common case)
-        let msg: Cow<'_, str> = if text.len() > 140 && text.chars().count() > 140 {
-            Cow::Owned(text.chars().take(140).collect())
-        } else {
-            Cow::Borrowed(text)
+        let msg = match text.char_indices().nth(140) {
+            Some((idx, _)) => text[..idx].to_string(),
+            None => text.to_string(),
         };
         self.send_osc_message("/chatbox/input", vec![
-            rosc::OscType::String(msg.into_owned()),
+            rosc::OscType::String(msg),
             rosc::OscType::Bool(true),
         ]);
     }
@@ -446,6 +449,7 @@ impl Default for PerihelionApp {
             test_file_path: String::new(),
             engine: None,
             audio_running: Arc::new(AtomicBool::new(false)),
+            osc_running: None,
             model_dir,
             osc_socket,
             available_devices,
@@ -488,37 +492,54 @@ impl eframe::App for PerihelionApp {
             return;
         }
 
-        // Sidebar
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .exact_width(100.0)
+        // Custom Navbar / Titlebar
+        egui::TopBottomPanel::top("navbar")
             .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::same(6.0)),
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(18, 18, 18))
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
             )
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
-                    ui.add_space(4.0);
+                // Drag area for the title bar
+                let title_bar_rect = ui.max_rect();
+                let title_bar_response = ui.interact(title_bar_rect, ui.id().with("title_bar"), egui::Sense::click_and_drag());
+                if title_bar_response.is_pointer_button_down_on() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
 
-                    let mut sel =
-                        |ui: &mut egui::Ui, label: &str, view: View| {
-                            let active = self.view == view;
-                            if ui
-                                .add_sized(
-                                    [88.0, 28.0],
-                                    egui::SelectableLabel::new(active, label),
-                                )
-                                .clicked()
-                            {
-                                self.view = view;
-                            }
-                        };
+                ui.horizontal_centered(|ui| {
+                    ui.label(egui::RichText::new("Perihelion").font(egui::FontId::proportional(18.0)).strong().color(egui::Color32::from_rgb(220, 220, 220)));
+                    
+                    ui.add_space(24.0);
+
+                    // Nav links
+                    let mut sel = |ui: &mut egui::Ui, label: &str, view: View| {
+                        let active = self.view == view;
+                        let bg_color = if active { egui::Color32::from_rgb(80, 80, 80) } else { egui::Color32::TRANSPARENT };
+                        let text_color = if active { egui::Color32::WHITE } else { egui::Color32::GRAY };
+                        
+                        let btn = egui::Button::new(egui::RichText::new(label).size(14.0).color(text_color))
+                            .fill(bg_color)
+                            .rounding(4.0)
+                            .frame(true);
+                            
+                        if ui.add(btn).clicked() {
+                            self.view = view;
+                        }
+                    };
 
                     sel(ui, "Main", View::Main);
+                    ui.add_space(8.0);
                     sel(ui, "Settings", View::Settings);
+                    ui.add_space(8.0);
                     sel(ui, "Debug", View::Debug);
-                    sel(ui, "Help", View::Help);
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_btn = ui.add(egui::Button::new(egui::RichText::new("✖").size(16.0)).frame(false));
+                        if close_btn.is_pointer_button_down_on() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 });
             });
 
@@ -775,14 +796,6 @@ impl eframe::App for PerihelionApp {
                             }
 
                             ui.add_space(12.0);
-                            ui.label("Hardware Processor:");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.radio_value(&mut self.settings.provider, Provider::Cpu, "CPU");
-                                ui.radio_value(&mut self.settings.provider, Provider::Dml, "GPU");
-                                ui.radio_value(&mut self.settings.provider, Provider::Cuda, "GPU-CUDA)");
-                            });
-
-                            ui.add_space(12.0);
                             ui.horizontal(|ui| {
                                 ui.label("CPU Threads:");
                                 ui.add(egui::DragValue::new(&mut self.settings.num_threads).speed(1).range(1..=16));
@@ -861,31 +874,6 @@ impl eframe::App for PerihelionApp {
                                 self.status_message = Cow::Borrowed("Model not ready");
                             }
                         }
-                    });
-                }
-
-                View::Help => {
-                    ui.heading(egui::RichText::new("Help & Tips").size(22.0).strong());
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.label(egui::RichText::new("Perihelion is an AI-powered speech-to-text app for VRC.").size(14.0));
-                        ui.add_space(16.0);
-
-                        ui.label(egui::RichText::new("Listening Modes").size(16.0).strong());
-                        ui.add_space(4.0);
-                        egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
-                            ui.label(egui::RichText::new("Toggle-Button:").strong());
-                            ui.add(egui::Label::new("Click the big Start/Stop button on the Main tab to dictate manually.").wrap());
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("OSC (VRChat):").strong());
-                            ui.add(egui::Label::new("Listens when the VRChat avatar parameter \"perihelion\" is ON in your avatar, whether via toggle or contact or whatever.").wrap());
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Always On:").strong());
-                            ui.add(egui::Label::new("The microphone remains active no matter what. Probably not a good idea.").wrap());
-                        });
                     });
                 }
             }

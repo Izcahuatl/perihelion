@@ -21,7 +21,7 @@ pub fn download_file_with_progress(
     // won't be mistaken for a valid model file on next launch
     let tmp_dest = dest.with_extension("part");
     let mut file = BufWriter::new(std::fs::File::create(&tmp_dest)?);
-    let mut buffer = [0u8; 65536];
+    let mut buffer = [0u8; 262_144];
     let mut downloaded: u64 = 0;
     let mut last_reported: u64 = 0;
     let mut reader = response.into_body().into_reader();

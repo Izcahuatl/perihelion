@@ -1,5 +1,6 @@
-use rosc::{OscPacket, OscType};
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use eframe::egui;
 
@@ -27,13 +28,14 @@ fn extract_perihelion_value(packet: &rosc::OscPacket) -> Option<bool> {
     }
 }
 
-pub fn run_osc_listener(tx: Sender<bool>, ctx: egui::Context) {
+pub fn run_osc_listener(tx: Sender<bool>, ctx: egui::Context, running: Arc<AtomicBool>) {
     let socket = match UdpSocket::bind("0.0.0.0:9001") {
         Ok(s) => s,
         Err(_) => return,
     };
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     let mut buf = [0u8; rosc::decoder::MTU];
-    loop {
+    while running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((size, _)) => {
                 if let Ok((_, packet)) = rosc::decoder::decode_udp(&buf[..size]) {
@@ -44,6 +46,9 @@ pub fn run_osc_listener(tx: Sender<bool>, ctx: egui::Context) {
                         ctx.request_repaint();
                     }
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
             }
             Err(_) => break,
         }

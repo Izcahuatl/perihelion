@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -6,9 +7,9 @@ use crate::engine::AsrEngine;
 use crate::events::TranscriptionEvent;
 use crate::engine::clean_transcription;
 
-pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
+pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f32]> {
     if in_rate == out_rate {
-        return input.to_vec();
+        return Cow::Borrowed(input);
     }
 
     // For the common 48kHz→16kHz (ratio=3) or 44.1kHz→16kHz case,
@@ -22,7 +23,6 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
             let filtered_len = input.len() - factor + 1;
             let actual_out_len = (filtered_len as f32 / ratio).ceil() as usize;
             let mut out = Vec::with_capacity(actual_out_len);
-
             for i in 0..actual_out_len {
                 let in_pos = i as f32 * ratio;
                 let idx = in_pos as usize; // floor for positive values
@@ -38,7 +38,7 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
                     out.push(s0);
                 }
             }
-            return out;
+            return Cow::Owned(out);
         }
     }
 
@@ -55,7 +55,24 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
             out.push(input[idx]);
         }
     }
-    out
+    Cow::Owned(out)
+}
+
+fn try_transcribe_and_send(
+    engine: &AsrEngine,
+    samples: &[f32],
+    sample_rate: u32,
+    tx: &Sender<TranscriptionEvent>,
+    ctx: &egui::Context,
+) {
+    let resampled = resample_linear(samples, sample_rate, 16000);
+    if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
+        let clean_text = clean_transcription(&text);
+        if !clean_text.is_empty() {
+            let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
+            ctx.request_repaint();
+        }
+    }
 }
 
 pub fn run_audio_capture(
@@ -181,14 +198,7 @@ pub fn run_audio_capture(
                         is_speaking = false;
 
                         if !samples_to_process.is_empty() {
-                            let resampled = resample_linear(&samples_to_process, sample_rate as u32, 16000);
-                            if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
-                                let clean_text = clean_transcription(&text);
-                                if !clean_text.is_empty() {
-                                    let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
-                                    ctx.request_repaint();
-                                }
-                            }
+                            try_transcribe_and_send(&*engine, &samples_to_process, sample_rate as u32, &tx, &ctx);
                         }
                         continue;
                     }
@@ -198,14 +208,7 @@ pub fn run_audio_capture(
             // Transcribe any remaining samples and clear out the buffer
             let samples = engine.clear_buffer();
             if !samples.is_empty() && is_speaking {
-                let resampled = resample_linear(&samples, sample_rate as u32, 16000);
-                if let Ok(text) = engine.transcribe_samples(16000, &resampled) {
-                    let clean_text = clean_transcription(&text);
-                    if !clean_text.is_empty() {
-                        let _ = tx.send(TranscriptionEvent::FinalResult(clean_text));
-                        ctx.request_repaint();
-                    }
-                }
+                try_transcribe_and_send(&*engine, &samples, sample_rate as u32, &tx, &ctx);
             }
         }
         Err(e) => {

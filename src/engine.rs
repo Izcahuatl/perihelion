@@ -59,7 +59,7 @@ pub fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result
             ..Default::default()
         },
         num_threads: settings.num_threads,
-        provider: Some(settings.provider.as_config_str().to_string()),
+        provider: Some("cpu".to_string()),
         debug: false,
         ..Default::default()
     };

@@ -17,10 +17,12 @@ use theme::{load_custom_font, setup_custom_style};
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([540.0, 440.0])
-            .with_min_inner_size([540.0, 440.0])
-            .with_max_inner_size([540.0, 440.0])
-            .with_resizable(false),
+            .with_inner_size([600.0, 500.0])
+            .with_min_inner_size([600.0, 500.0])
+            .with_max_inner_size([600.0, 500.0])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true),
         ..Default::default()
     };
 

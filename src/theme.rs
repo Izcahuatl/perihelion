@@ -38,19 +38,24 @@ pub fn load_custom_font(cc: &eframe::CreationContext<'_>) {
 pub fn setup_custom_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 10.0);
-    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.window_margin = egui::Margin::same(20.0);
 
     let rounding = egui::Rounding::same(8.0);
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(24, 24, 28);
-    visuals.window_fill = egui::Color32::from_rgb(30, 30, 34);
+    visuals.panel_fill = egui::Color32::from_rgb(26, 26, 26);
+    visuals.window_fill = egui::Color32::from_rgb(32, 32, 32);
 
-    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(40, 40, 46);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(50, 50, 58);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(70, 70, 80);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(90, 90, 105);
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(60, 60, 60);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(80, 80, 80);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(100, 100, 100);
+
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 55, 55));
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 70));
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 110, 110));
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 150, 150));
 
     visuals.widgets.noninteractive.rounding = rounding;
     visuals.widgets.inactive.rounding = rounding;
@@ -58,6 +63,11 @@ pub fn setup_custom_style(ctx: &egui::Context) {
     visuals.widgets.active.rounding = rounding;
     visuals.widgets.open.rounding = rounding;
     visuals.window_rounding = egui::Rounding::same(12.0);
+
+    visuals.selection.bg_fill = egui::Color32::from_rgb(100, 140, 255);
+
+    // Make it look static, remove all animations
+    style.animation_time = 0.0;
 
     style.visuals = visuals;
 

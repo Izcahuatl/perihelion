@@ -22,28 +22,6 @@ impl ListeningMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Provider {
-    Cpu,
-    Dml,
-    Cuda,
-}
-
-impl Default for Provider {
-    fn default() -> Self {
-        Provider::Cpu
-    }
-}
-impl Provider {
-    pub fn as_config_str(&self) -> &'static str {
-        match self {
-            Provider::Cpu => "cpu",
-            Provider::Dml => "dml",
-            Provider::Cuda => "cuda",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub listening_mode: ListeningMode,
@@ -54,7 +32,6 @@ pub struct Settings {
     pub search_depth: i32,
     pub hotwords: String,
     pub hotwords_boost: f32,
-    pub provider: Provider,
 }
 
 impl Default for Settings {
@@ -68,7 +45,6 @@ impl Default for Settings {
             search_depth: 4,
             hotwords: String::new(),
             hotwords_boost: 1.5,
-            provider: Provider::default(),
         }
     }
 }
