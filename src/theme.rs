@@ -66,9 +66,6 @@ pub fn setup_custom_style(ctx: &egui::Context) {
 
     visuals.selection.bg_fill = egui::Color32::from_rgb(100, 140, 255);
 
-    // Make it look static, remove all animations
-    style.animation_time = 0.0;
-
     style.visuals = visuals;
 
     if let Some(text_style) = style.text_styles.get_mut(&egui::TextStyle::Heading) {

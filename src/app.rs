@@ -113,19 +113,16 @@ impl PerihelionApp {
         let host = cpal::default_host();
         let mut devices = Vec::new();
 
-        // Add default device name
         if let Some(device) = host.default_input_device() {
             if let Ok(desc) = device.description() {
                 devices.push(format!("{} (default)", desc.name()));
             }
         }
 
-        // Add all other devices
         if let Ok(device_iter) = host.input_devices() {
             for device in device_iter {
                 if let Ok(desc) = device.description() {
                     let name = desc.name();
-                    // Skip if it's the default device we already added
                     if !devices.iter().any(|d| d.contains(name)) {
                         devices.push(name.to_string());
                     }
@@ -133,7 +130,6 @@ impl PerihelionApp {
             }
         }
 
-        // If no devices found, add a placeholder
         if devices.is_empty() {
             devices.push("No devices found".to_string());
         }
@@ -246,7 +242,6 @@ impl PerihelionApp {
                     self.model_status = ModelStatus::Error(e);
                 }
                 DownloadEvent::AllDone => {
-                    // Don't put rx back — download is complete
                     self.start_init_engine();
                     return;
                 }
@@ -329,10 +324,8 @@ impl PerihelionApp {
                 }
             }
             ListeningMode::ToggleButton => {
-                // state is managed by button clicks
             }
             ListeningMode::ToggleOsc => {
-                // state is managed by OSC events
             }
         }
     }
@@ -492,7 +485,6 @@ impl eframe::App for PerihelionApp {
             return;
         }
 
-        // Custom Navbar / Titlebar
         egui::TopBottomPanel::top("navbar")
             .frame(
                 egui::Frame::none()
@@ -500,7 +492,6 @@ impl eframe::App for PerihelionApp {
                     .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
             )
             .show(ctx, |ui| {
-                // Drag area for the title bar
                 let title_bar_rect = ui.max_rect();
                 let title_bar_response = ui.interact(title_bar_rect, ui.id().with("title_bar"), egui::Sense::click_and_drag());
                 if title_bar_response.is_pointer_button_down_on() {
@@ -512,7 +503,6 @@ impl eframe::App for PerihelionApp {
                     
                     ui.add_space(24.0);
 
-                    // Nav links
                     let mut sel = |ui: &mut egui::Ui, label: &str, view: View| {
                         let active = self.view == view;
                         let bg_color = if active { egui::Color32::from_rgb(80, 80, 80) } else { egui::Color32::TRANSPARENT };
@@ -543,7 +533,6 @@ impl eframe::App for PerihelionApp {
                 });
             });
 
-        // Content
         let frame = egui::Frame::central_panel(&ctx.style())
             .inner_margin(egui::Margin::same(20.0));
 
@@ -552,7 +541,6 @@ impl eframe::App for PerihelionApp {
 
             match self.view {
                 View::Main => {
-                    // Title + model status
                     ui.horizontal(|ui| {
                         ui.heading("Perihelion");
                         ui.with_layout(
@@ -590,7 +578,6 @@ impl eframe::App for PerihelionApp {
 
                     ui.separator();
 
-                    // Download / progress
                     match &self.model_status {
                         ModelStatus::NotDownloaded => {
                             if ui
@@ -644,13 +631,11 @@ impl eframe::App for PerihelionApp {
                         ModelStatus::Ready => {}
                     }
 
-                    // Mode label
                     ui.horizontal(|ui| {
                         ui.label("Mode:");
                         ui.label(self.settings.listening_mode.as_str());
                     });
 
-                    // Listen button
                     let text = if self.is_listening { "On" } else { "Off" };
                     let color = if self.is_listening {
                         egui::Color32::from_rgb(0, 150, 0)
@@ -672,7 +657,6 @@ impl eframe::App for PerihelionApp {
                         }
                     }
 
-                    // Text output
                     ui.horizontal(|ui| {
                         ui.label("Output");
                         ui.with_layout(
@@ -698,7 +682,6 @@ impl eframe::App for PerihelionApp {
                         );
                     });
 
-                    // Status
                     ui.horizontal(|ui| {
                         ui.label(self.status_message.as_ref());
                         if self.is_listening {
