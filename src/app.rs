@@ -483,6 +483,8 @@ impl eframe::App for PerihelionApp {
         self.handle_osc_events(ctx);
         self.sync_listening_state(ctx);
 
+        let lang = self.settings.language;
+
         let any_busy = matches!(self.model_status_small, ModelStatus::Downloading { .. } | ModelStatus::Initializing)
             || matches!(self.model_status_large, ModelStatus::Downloading { .. } | ModelStatus::Initializing);
         if any_busy || self.is_listening {
@@ -498,7 +500,7 @@ impl eframe::App for PerihelionApp {
                         ui.add_space(ui.available_height() / 2.0 - 40.0);
                         ui.add_sized([40.0, 40.0], egui::Spinner::new());
                         ui.add_space(20.0);
-                        ui.heading(egui::RichText::new("Hang on, the model's starting!").size(24.0));
+                        ui.heading(egui::RichText::new(lang.tr("Hang on, the model's starting!")).size(24.0));
                     });
                 });
             return;
@@ -537,13 +539,13 @@ impl eframe::App for PerihelionApp {
                         }
                     };
 
-                    sel(ui, "Main", View::Main);
+                    sel(ui, lang.tr("Main"), View::Main);
                     ui.add_space(8.0);
-                    sel(ui, "Manage", View::Manage);
+                    sel(ui, lang.tr("Manage"), View::Manage);
                     ui.add_space(8.0);
-                    sel(ui, "Settings", View::Settings);
+                    sel(ui, lang.tr("Settings"), View::Settings);
                     ui.add_space(8.0);
-                    sel(ui, "Debug", View::Debug);
+                    sel(ui, lang.tr("Debug"), View::Debug);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let close_btn = ui.add(egui::Button::new(egui::RichText::new("X").size(16.0)).frame(false));
@@ -563,7 +565,7 @@ impl eframe::App for PerihelionApp {
             match self.view {
                 View::Main => {
                     ui.horizontal(|ui| {
-                        ui.label("Mode:");
+                        ui.label(lang.tr("Mode:"));
                         ui.label(self.settings.listening_mode.as_str());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -572,28 +574,28 @@ impl eframe::App for PerihelionApp {
                                     let status = self.model_status(variant);
                                     match status {
                                         ModelStatus::Ready => {
-                                            ui.colored_label(egui::Color32::GREEN, "ready");
+                                            ui.colored_label(egui::Color32::GREEN, lang.tr("ready"));
                                         }
                                         ModelStatus::Initializing => {
                                             ui.add_sized([12.0, 12.0], egui::Spinner::new());
-                                            ui.label("initializing");
+                                            ui.label(lang.tr("initializing"));
                                         }
                                         ModelStatus::Error(_) => {
-                                            ui.colored_label(egui::Color32::RED, "error");
+                                            ui.colored_label(egui::Color32::RED, lang.tr("error"));
                                         }
                                         _ => {}
                                     }
                                     ui.label(variant.label());
                                     ui.label("·");
                                 } else {
-                                    ui.colored_label(egui::Color32::GRAY, "none");
-                                    ui.label("Model:");
+                                    ui.colored_label(egui::Color32::GRAY, lang.tr("none"));
+                                    ui.label(lang.tr("Model:"));
                                 }
                             },
                         );
                     });
 
-                    let text = if self.is_listening { "On" } else { "Off" };
+                    let text = if self.is_listening { lang.tr("On") } else { lang.tr("Off") };
                     let color = if self.is_listening {
                         egui::Color32::from_rgb(0, 150, 0)
                     } else {
@@ -617,15 +619,15 @@ impl eframe::App for PerihelionApp {
                     }
 
                     ui.horizontal(|ui| {
-                        ui.label("Output");
+                        ui.label(lang.tr("Output"));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.button("Copy").clicked() {
+                                if ui.button(lang.tr("Copy")).clicked() {
                                     self.copy_to_clipboard(&self.recognized_text);
                                     self.status_message = Cow::Borrowed("Copied");
                                 }
-                                if ui.button("Clear").clicked() {
+                                if ui.button(lang.tr("Clear")).clicked() {
                                     self.clear_text();
                                 }
                             },
@@ -642,15 +644,30 @@ impl eframe::App for PerihelionApp {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(self.status_message.as_ref());
+                        ui.label(lang.tr(self.status_message.as_ref()));
                         if self.is_listening {
                             ui.spinner();
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let mut current_lang = self.settings.language;
+                            egui::ComboBox::from_id_salt("lang_toggle")
+                                .selected_text(match current_lang {
+                                    crate::config::Language::English => "English",
+                                    crate::config::Language::Japanese => "日本語",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut current_lang, crate::config::Language::English, "English");
+                                    ui.selectable_value(&mut current_lang, crate::config::Language::Japanese, "日本語");
+                                });
+                            if current_lang != self.settings.language {
+                                self.settings.language = current_lang;
+                            }
+                        });
                     });
                 }
 
                 View::Manage => {
-                    ui.heading(egui::RichText::new("Manage Models").size(22.0).strong());
+                    ui.heading(egui::RichText::new(lang.tr("Manage Models")).size(22.0).strong());
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -666,25 +683,25 @@ impl eframe::App for PerihelionApp {
                                     ui.strong(egui::RichText::new(variant.label()).size(16.0));
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if is_active {
-                                            ui.colored_label(egui::Color32::GREEN, "● Running");
+                                            ui.colored_label(egui::Color32::GREEN, lang.tr("● Running"));
                                         } else {
                                             match &status {
                                                 ModelStatus::Ready => {
-                                                    ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "Downloaded");
+                                                    ui.colored_label(egui::Color32::from_rgb(180, 180, 180), lang.tr("Downloaded"));
                                                 }
                                                 ModelStatus::NotDownloaded => {
-                                                    ui.colored_label(egui::Color32::YELLOW, "Not downloaded");
+                                                    ui.colored_label(egui::Color32::YELLOW, lang.tr("Not downloaded"));
                                                 }
                                                 ModelStatus::Downloading { .. } => {
                                                     ui.add_sized([12.0, 12.0], egui::Spinner::new());
-                                                    ui.label("Downloading...");
+                                                    ui.label(lang.tr("Downloading..."));
                                                 }
                                                 ModelStatus::Initializing => {
                                                     ui.add_sized([12.0, 12.0], egui::Spinner::new());
-                                                    ui.label("Starting...");
+                                                    ui.label(lang.tr("Starting..."));
                                                 }
                                                 ModelStatus::Error(_) => {
-                                                    ui.colored_label(egui::Color32::RED, "Error");
+                                                    ui.colored_label(egui::Color32::RED, lang.tr("Error"));
                                                 }
                                             }
                                         }
@@ -698,7 +715,7 @@ impl eframe::App for PerihelionApp {
                                             ui.horizontal(|ui| {
                                                 ui.colored_label(
                                                     egui::Color32::from_rgb(255, 180, 50),
-                                                    format!("Your system has {:.1} GB RAM. The model may crash or run very slowly.", ram),
+                                                    format!("{}{}{}", lang.tr("Your system has "), ram, lang.tr(" GB RAM. The model may crash or run very slowly.")),
                                                 );
                                             });
                                         }
@@ -721,7 +738,7 @@ impl eframe::App for PerihelionApp {
                                     } else {
                                         ui.add_sized(
                                             [ui.available_width(), 16.0],
-                                            egui::ProgressBar::new(0.0).text("Starting..."),
+                                            egui::ProgressBar::new(0.0).text(lang.tr("Starting...")),
                                         );
                                     }
                                 }
@@ -738,7 +755,7 @@ impl eframe::App for PerihelionApp {
                                             let already_downloading = self.download_rx.is_some();
                                             let btn = ui.add_enabled(
                                                 !already_downloading,
-                                                egui::Button::new("Download"),
+                                                egui::Button::new(lang.tr("Download")),
                                             );
                                             if btn.clicked() {
                                                 self.start_download(variant);
@@ -746,7 +763,7 @@ impl eframe::App for PerihelionApp {
                                         }
                                         ModelStatus::Ready => {
                                             if is_active {
-                                                if ui.button("Stop").clicked() {
+                                                if ui.button(lang.tr("Stop")).clicked() {
                                                     if self.is_listening {
                                                         self.set_listening(false, ctx);
                                                     }
@@ -758,7 +775,7 @@ impl eframe::App for PerihelionApp {
                                                 let initializing_any = self.init_rx.is_some();
                                                 let btn = ui.add_enabled(
                                                     !initializing_any,
-                                                    egui::Button::new("Start"),
+                                                    egui::Button::new(lang.tr("Start")),
                                                 );
                                                 if btn.clicked() {
                                                     self.start_init_engine(variant, Some(ctx));
@@ -767,7 +784,7 @@ impl eframe::App for PerihelionApp {
 
                                             ui.add_space(8.0);
                                             if ui.add(egui::Button::new(
-                                                egui::RichText::new("Delete").color(egui::Color32::from_rgb(200, 80, 80)),
+                                                egui::RichText::new(lang.tr("Delete")).color(egui::Color32::from_rgb(200, 80, 80)),
                                             )).clicked() {
                                                 if is_active {
                                                     if self.is_listening {
@@ -791,7 +808,7 @@ impl eframe::App for PerihelionApp {
                 }
 
                 View::Settings => {
-                    ui.heading(egui::RichText::new("Settings").size(22.0).strong());
+                    ui.heading(egui::RichText::new(lang.tr("Settings")).size(22.0).strong());
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -800,40 +817,40 @@ impl eframe::App for PerihelionApp {
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
                             ui.checkbox(
                                 &mut self.settings.auto_copy,
-                                "Auto-copy to clipboard",
+                                lang.tr("Auto-copy to clipboard"),
                             );
                             ui.add_space(4.0);
                             ui.checkbox(
                                 &mut self.settings.append_mode,
-                                "Append transcriptions",
+                                lang.tr("Append transcriptions"),
                             );
                         });
 
                         ui.add_space(16.0);
-                        ui.label(egui::RichText::new("Activation Mode").size(16.0).strong());
+                        ui.label(egui::RichText::new(lang.tr("Activation Mode")).size(16.0).strong());
                         ui.add_space(4.0);
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.radio_value(
                                     &mut self.settings.listening_mode,
                                     ListeningMode::ToggleButton,
-                                    "Toggle-Button (Manual)",
+                                    lang.tr("Toggle-Button (Manual)"),
                                 );
                                 ui.radio_value(
                                     &mut self.settings.listening_mode,
                                     ListeningMode::AlwaysOn,
-                                    "Always On",
+                                    lang.tr("Always On"),
                                 );
                                 ui.radio_value(
                                     &mut self.settings.listening_mode,
                                     ListeningMode::ToggleOsc,
-                                    "OSC (VRChat)",
+                                    lang.tr("OSC (VRChat)"),
                                 );
                             });
                         });
 
                         ui.add_space(16.0);
-                        ui.label(egui::RichText::new("Microphone").size(16.0).strong());
+                        ui.label(egui::RichText::new(lang.tr("Microphone")).size(16.0).strong());
                         ui.add_space(4.0);
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -841,7 +858,7 @@ impl eframe::App for PerihelionApp {
                                     .selected_text(
                                         self.available_devices.get(self.selected_device)
                                             .map(|s| s.as_str())
-                                            .unwrap_or("Unknown")
+                                            .unwrap_or(lang.tr("Unknown"))
                                     )
                                     .width(260.0)
                                     .show_ui(ui, |ui| {
@@ -854,7 +871,7 @@ impl eframe::App for PerihelionApp {
                                         }
                                     });
 
-                                if ui.button("↻ Refresh").clicked() {
+                                if ui.button(lang.tr("Refresh")).clicked() {
                                     self.available_devices = Self::get_available_devices();
                                     self.selected_device = 0;
                                     self.status_message = Cow::Borrowed("Devices refreshed");
@@ -863,30 +880,30 @@ impl eframe::App for PerihelionApp {
                         });
 
                         ui.add_space(20.0);
-                        ui.heading(egui::RichText::new("AI Preferences").size(18.0).strong());
+                        ui.heading(egui::RichText::new(lang.tr("AI Preferences")).size(18.0).strong());
                         ui.add_space(8.0);
 
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
-                            ui.checkbox(&mut self.settings.high_accuracy, "High Accuracy Mode (Modified Beam Search)");
+                            ui.checkbox(&mut self.settings.high_accuracy, lang.tr("High Accuracy Mode (Modified Beam Search)"));
                             if self.settings.high_accuracy {
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
-                                    ui.label("Search Depth:");
+                                    ui.label(lang.tr("Search Depth:"));
                                     ui.add(egui::DragValue::new(&mut self.settings.search_depth).range(1..=10));
                                 });
-                                ui.label(egui::RichText::new("Higher = More accurate but requires more CPU power").color(egui::Color32::GRAY));
+                                ui.label(egui::RichText::new(lang.tr("Higher = More accurate but requires more CPU power")).color(egui::Color32::GRAY));
                             }
 
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
-                                ui.label("CPU Threads:");
+                                ui.label(lang.tr("CPU Threads:"));
                                 ui.add(egui::DragValue::new(&mut self.settings.num_threads).speed(1).range(1..=16));
                             });
                         });
 
                         ui.add_space(16.0);
-                        ui.label(egui::RichText::new("Custom Dictionary").size(16.0).strong());
-                        ui.add(egui::Label::new(egui::RichText::new("Add terms to help the AI recognize them").color(egui::Color32::GRAY)).wrap());
+                        ui.label(egui::RichText::new(lang.tr("Custom Dictionary")).size(16.0).strong());
+                        ui.add(egui::Label::new(egui::RichText::new(lang.tr("Add terms to help the AI recognize them")).color(egui::Color32::GRAY)).wrap());
                         ui.add_space(4.0);
                         ui.add(
                             egui::TextEdit::multiline(&mut self.settings.hotwords)
@@ -896,12 +913,12 @@ impl eframe::App for PerihelionApp {
                         );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            ui.label("Hotword Focus:");
-                            ui.add(egui::Slider::new(&mut self.settings.hotwords_boost, 0.0..=10.0).text("Boost multiplier"));
+                            ui.label(lang.tr("Hotword Focus:"));
+                            ui.add(egui::Slider::new(&mut self.settings.hotwords_boost, 0.0..=10.0).text(lang.tr("Boost multiplier")));
                         });
 
                         ui.add_space(16.0);
-                        if ui.button(egui::RichText::new("Apply Settings & Reload").size(16.0)).clicked() {
+                        if ui.button(egui::RichText::new(lang.tr("Apply Settings & Reload")).size(16.0)).clicked() {
                             self.save_config();
                             if let Some(variant) = self.active_model {
                                 self.start_init_engine(variant, Some(ctx));
@@ -909,25 +926,25 @@ impl eframe::App for PerihelionApp {
                         }
 
                         ui.add_space(20.0);
-                        ui.heading(egui::RichText::new("Danger Zone").size(18.0).strong().color(egui::Color32::RED));
+                        ui.heading(egui::RichText::new(lang.tr("Danger Zone")).size(18.0).strong().color(egui::Color32::RED));
                         ui.add_space(8.0);
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
-                            ui.label("Reset all settings to their factory defaults.");
+                            ui.label(lang.tr("Reset all settings to their factory defaults."));
                             ui.add_space(4.0);
-                            if ui.button(egui::RichText::new("Reset Config").size(16.0).color(egui::Color32::RED)).clicked() {
+                            if ui.button(egui::RichText::new(lang.tr("Reset Config")).size(16.0).color(egui::Color32::RED)).clicked() {
                                 self.settings = Settings::default();
                                 self.selected_device = 0;
                                 self.save_config();
                                 self.status_message = Cow::Borrowed("Config reset");
                             }
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Use the Manage tab to delete model files.").color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new(lang.tr("Use the Manage tab to delete model files.")).color(egui::Color32::GRAY));
                         });
                     });
                 }
 
                 View::Debug => {
-                    ui.heading(egui::RichText::new("Debug").size(22.0).strong());
+                    ui.heading(egui::RichText::new(lang.tr("Debug")).size(22.0).strong());
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -935,9 +952,9 @@ impl eframe::App for PerihelionApp {
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [avail * 0.7, 24.0],
-                            egui::TextEdit::singleline(&mut self.test_file_path).hint_text("Path to .wav file"),
+                            egui::TextEdit::singleline(&mut self.test_file_path).hint_text(lang.tr("Path to .wav file")),
                         );
-                        if ui.button("Run").clicked() {
+                        if ui.button(lang.tr("Run")).clicked() {
                             if let Some(engine) = &self.engine {
                                 let path = Path::new(&self.test_file_path);
                                 match engine.transcribe_file(path) {
