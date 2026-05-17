@@ -1,3 +1,4 @@
+
 use eframe::egui;
 use std::borrow::Cow;
 use std::net::UdpSocket;
@@ -9,7 +10,7 @@ use std::thread;
 
 use crate::config::{AppConfig, ListeningMode, Settings};
 use crate::events::{DownloadEvent, InitEvent, TranscriptionEvent};
-use crate::engine::{AsrEngine, MODEL_FILES, MODEL_REPO};
+use crate::engine::{AsrEngine, ModelVariant, MODEL_FILES, get_total_ram_gb};
 use crate::audio::run_audio_capture;
 use crate::download::download_file_with_progress;
 use crate::osc::run_osc_listener;
@@ -32,6 +33,7 @@ impl Eq for ModelStatus {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Main,
+    Manage,
     Settings,
     Debug,
 }
@@ -43,8 +45,11 @@ impl Default for View {
 }
 pub struct PerihelionApp {
     view: View,
-    model_status: ModelStatus,
+    model_status_small: ModelStatus,
+    model_status_large: ModelStatus,
+    active_model: Option<ModelVariant>,
     download_rx: Option<Receiver<DownloadEvent>>,
+    downloading_variant: Option<ModelVariant>,
     init_rx: Option<Receiver<InitEvent>>,
     osc_rx: Option<Receiver<bool>>,
     transcription_rx: Option<Receiver<TranscriptionEvent>>,
@@ -56,19 +61,25 @@ pub struct PerihelionApp {
     engine: Option<Arc<AsrEngine>>,
     audio_running: Arc<AtomicBool>,
     osc_running: Option<Arc<AtomicBool>>,
-    model_dir: PathBuf,
     osc_socket: Option<UdpSocket>,
     available_devices: Vec<String>,
     selected_device: usize,
+    total_ram_gb: Option<f64>,
 }
 
 impl PerihelionApp {
-    fn model_dir() -> PathBuf {
-        dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("perihelion")
-            .join("models")
-            .join("qwen3-asr-0.6b-int8")
+    fn model_status(&self, variant: ModelVariant) -> &ModelStatus {
+        match variant {
+            ModelVariant::Small => &self.model_status_small,
+            ModelVariant::Large => &self.model_status_large,
+        }
+    }
+
+    fn set_model_status(&mut self, variant: ModelVariant, status: ModelStatus) {
+        match variant {
+            ModelVariant::Small => self.model_status_small = status,
+            ModelVariant::Large => self.model_status_large = status,
+        }
     }
 
     fn config_path() -> PathBuf {
@@ -82,7 +93,7 @@ impl PerihelionApp {
         let path = Self::config_path();
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&contents) {
+                if let Ok(config) = nanoserde::DeJson::deserialize_json(&contents) {
                     return Some(config);
                 }
             }
@@ -99,9 +110,8 @@ impl PerihelionApp {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(&config) {
-            let _ = std::fs::write(&path, json);
-        }
+        let json = nanoserde::SerJson::serialize_json(&config);
+        let _ = std::fs::write(&path, json);
     }
 
     fn check_model_exists(model_dir: &Path) -> bool {
@@ -137,13 +147,15 @@ impl PerihelionApp {
         devices
     }
 
-    fn start_download(&mut self) {
-        self.model_status = ModelStatus::Downloading {
+    fn start_download(&mut self, variant: ModelVariant) {
+        self.set_model_status(variant, ModelStatus::Downloading {
             current_file: Arc::from(MODEL_FILES[0]),
             current_bytes: 0,
             total_bytes: 0,
-        };
-        let model_dir = self.model_dir.clone();
+        });
+        self.downloading_variant = Some(variant);
+        let model_dir = variant.model_dir();
+        let repo = variant.repo();
         let (tx, rx) = channel();
         self.download_rx = Some(rx);
         let files: Vec<String> = MODEL_FILES.iter().map(|f: &&str| f.to_string()).collect();
@@ -153,7 +165,7 @@ impl PerihelionApp {
             for file in &files {
                 let url = format!(
                     "https://huggingface.co/{}/resolve/main/{}",
-                    MODEL_REPO, file
+                    repo, file
                 );
                 let dest = model_dir.join(file.as_str());
                 if let Some(parent) = dest.parent() {
@@ -174,12 +186,29 @@ impl PerihelionApp {
         });
     }
 
-    fn start_init_engine(&mut self) {
-        self.model_status = ModelStatus::Initializing;
+    fn start_init_engine(&mut self, variant: ModelVariant, ctx: Option<&egui::Context>) {
+        if let Some(ctx) = ctx {
+            if self.is_listening {
+                self.set_listening(false, ctx);
+            }
+        }
+        self.engine = None;
+        if let Some(old) = self.active_model {
+            if old != variant {
+                self.set_model_status(old, if Self::check_model_exists(&old.model_dir()) {
+                    ModelStatus::Ready
+                } else {
+                    ModelStatus::NotDownloaded
+                });
+            }
+        }
+
+        self.set_model_status(variant, ModelStatus::Initializing);
+        self.active_model = Some(variant);
         self.status_message = Cow::Borrowed("Initializing...");
         let (tx, rx) = channel();
         self.init_rx = Some(rx);
-        let model_dir = self.model_dir.clone();
+        let model_dir = variant.model_dir();
         let settings = self.settings.clone();
 
         thread::spawn(move || {
@@ -205,14 +234,15 @@ impl PerihelionApp {
             None
         };
         if let Some(event) = event {
+            let variant = self.active_model.unwrap_or(ModelVariant::Small);
             match event {
                 InitEvent::Success(engine) => {
                     self.engine = Some(engine);
-                    self.model_status = ModelStatus::Ready;
+                    self.set_model_status(variant, ModelStatus::Ready);
                     self.status_message = Cow::Borrowed("Ready");
                 }
                 InitEvent::Error(e) => {
-                    self.model_status = ModelStatus::Error(e);
+                    self.set_model_status(variant, ModelStatus::Error(e));
                     self.status_message = Cow::Borrowed("Initialization failed");
                 }
             }
@@ -222,6 +252,7 @@ impl PerihelionApp {
 
     fn handle_download_events(&mut self) {
         let Some(rx) = self.download_rx.take() else { return };
+        let variant = self.downloading_variant.unwrap_or(ModelVariant::Small);
         while let Ok(event) = rx.try_recv() {
             match event {
                 DownloadEvent::Progress {
@@ -229,20 +260,22 @@ impl PerihelionApp {
                     bytes,
                     total,
                 } => {
-                    self.model_status = ModelStatus::Downloading {
+                    self.set_model_status(variant, ModelStatus::Downloading {
                         current_file: file,
                         current_bytes: bytes,
                         total_bytes: total,
-                    };
+                    });
                 }
                 DownloadEvent::FileDone(file) => {
                     self.status_message = Cow::Owned(format!("Downloaded: {}", file));
                 }
                 DownloadEvent::Error(e) => {
-                    self.model_status = ModelStatus::Error(e);
+                    self.set_model_status(variant, ModelStatus::Error(e));
                 }
                 DownloadEvent::AllDone => {
-                    self.start_init_engine();
+                    self.set_model_status(variant, ModelStatus::Ready);
+                    self.downloading_variant = None;
+                    self.status_message = Cow::Borrowed("Download complete");
                     return;
                 }
             }
@@ -410,8 +443,8 @@ impl PerihelionApp {
 }
 impl Default for PerihelionApp {
     fn default() -> Self {
-        let model_dir = Self::model_dir();
-        let model_exists = Self::check_model_exists(&model_dir);
+        let small_exists = Self::check_model_exists(&ModelVariant::Small.model_dir());
+        let large_exists = Self::check_model_exists(&ModelVariant::Large.model_dir());
         let osc_socket = UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
             s.connect("127.0.0.1:9000").ok().map(|_| s)
         });
@@ -424,34 +457,29 @@ impl Default for PerihelionApp {
         let selected_device = selected_device
             .min(available_devices.len().saturating_sub(1));
 
-        let mut app = Self {
+        Self {
             view: View::default(),
-            model_status: if model_exists {
-                ModelStatus::Ready
-            } else {
-                ModelStatus::NotDownloaded
-            },
+            model_status_small: if small_exists { ModelStatus::Ready } else { ModelStatus::NotDownloaded },
+            model_status_large: if large_exists { ModelStatus::Ready } else { ModelStatus::NotDownloaded },
+            active_model: None,
             download_rx: None,
+            downloading_variant: None,
             init_rx: None,
             osc_rx: None,
             transcription_rx: None,
             recognized_text: String::new(),
             is_listening: false,
-            status_message: Cow::Borrowed("Ready"),
+            status_message: Cow::Borrowed("No model loaded"),
             settings,
             test_file_path: String::new(),
             engine: None,
             audio_running: Arc::new(AtomicBool::new(false)),
             osc_running: None,
-            model_dir,
             osc_socket,
             available_devices,
             selected_device,
-        };
-        if model_exists {
-            app.start_init_engine();
+            total_ram_gb: get_total_ram_gb(),
         }
-        app
     }
 }
 impl eframe::App for PerihelionApp {
@@ -467,11 +495,14 @@ impl eframe::App for PerihelionApp {
         self.handle_osc_events(ctx);
         self.sync_listening_state(ctx);
 
-        if matches!(self.model_status, ModelStatus::Downloading { .. } | ModelStatus::Initializing) || self.is_listening {
+        let any_busy = matches!(self.model_status_small, ModelStatus::Downloading { .. } | ModelStatus::Initializing)
+            || matches!(self.model_status_large, ModelStatus::Downloading { .. } | ModelStatus::Initializing);
+        if any_busy || self.is_listening {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        if self.model_status == ModelStatus::Initializing {
+        let active_initializing = self.active_model.map_or(false, |v| *self.model_status(v) == ModelStatus::Initializing);
+        if active_initializing {
             egui::CentralPanel::default()
                 .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(20.0)))
                 .show(ctx, |ui| {
@@ -520,12 +551,14 @@ impl eframe::App for PerihelionApp {
 
                     sel(ui, "Main", View::Main);
                     ui.add_space(8.0);
+                    sel(ui, "Manage", View::Manage);
+                    ui.add_space(8.0);
                     sel(ui, "Settings", View::Settings);
                     ui.add_space(8.0);
                     sel(ui, "Debug", View::Debug);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = ui.add(egui::Button::new(egui::RichText::new("✖").size(16.0)).frame(false));
+                        let close_btn = ui.add(egui::Button::new(egui::RichText::new("X").size(16.0)).frame(false));
                         if close_btn.is_pointer_button_down_on() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -542,98 +575,33 @@ impl eframe::App for PerihelionApp {
             match self.view {
                 View::Main => {
                     ui.horizontal(|ui| {
-                        ui.heading("Perihelion");
+                        ui.label("Mode:");
+                        ui.label(self.settings.listening_mode.as_str());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                match &self.model_status {
-                                    ModelStatus::Ready => {
-                                        ui.colored_label(egui::Color32::GREEN, "ready");
+                                if let Some(variant) = self.active_model {
+                                    let status = self.model_status(variant);
+                                    match status {
+                                        ModelStatus::Ready => {
+                                            ui.colored_label(egui::Color32::GREEN, "ready");
+                                        }
+                                        ModelStatus::Initializing => {
+                                            ui.add_sized([12.0, 12.0], egui::Spinner::new());
+                                            ui.label("initializing");
+                                        }
+                                        ModelStatus::Error(_) => {
+                                            ui.colored_label(egui::Color32::RED, "error");
+                                        }
+                                        _ => {}
                                     }
-                                    ModelStatus::NotDownloaded => {
-                                        ui.colored_label(egui::Color32::YELLOW, "missing");
-                                    }
-                                    ModelStatus::Downloading { .. } => {
-                                        ui.add_sized(
-                                            [12.0, 12.0],
-                                            egui::Spinner::new(),
-                                        );
-                                        ui.label("downloading");
-                                    }
-                                    ModelStatus::Initializing => {
-                                        ui.add_sized(
-                                            [12.0, 12.0],
-                                            egui::Spinner::new(),
-                                        );
-                                        ui.label("initializing");
-                                    }
-                                    ModelStatus::Error(_) => {
-                                        ui.colored_label(egui::Color32::RED, "error");
-                                    }
+                                    ui.label(format!("{}:", variant.label()));
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "none");
+                                    ui.label("Model:");
                                 }
-                                ui.label("Model:");
                             },
                         );
-                    });
-
-                    ui.separator();
-
-                    match &self.model_status {
-                        ModelStatus::NotDownloaded => {
-                            if ui
-                                .add_sized(
-                                    [avail, 28.0],
-                                    egui::Button::new("Download ~1 GB"),
-                                )
-                                .clicked()
-                            {
-                                self.start_download();
-                            }
-                        }
-                        ModelStatus::Downloading {
-                            current_file,
-                            current_bytes,
-                            total_bytes,
-                        } => {
-                            if *total_bytes > 0 {
-                                let progress = *current_bytes as f32 / *total_bytes as f32;
-                                ui.add_sized(
-                                    [avail, 16.0],
-                                    egui::ProgressBar::new(progress).text(format!(
-                                        "{}  {} / {} MB",
-                                        current_file,
-                                        current_bytes / 1_000_000,
-                                        total_bytes / 1_000_000
-                                    )),
-                                );
-                            } else {
-                                ui.add_sized(
-                                    [avail, 16.0],
-                                    egui::ProgressBar::new(0.0).text("Starting..."),
-                                );
-                            }
-                        }
-                        ModelStatus::Initializing => {
-                            ui.add_sized(
-                                [avail, 16.0],
-                                egui::ProgressBar::new(1.0).text("Initializing..."),
-                            );
-                        }
-                        ModelStatus::Error(e) => {
-                            let err_msg = e.clone();
-                            ui.horizontal(|ui| {
-                                ui.colored_label(egui::Color32::RED, &err_msg);
-                                if ui.button("Retry").clicked() {
-                                    self.start_download();
-                                }
-                            });
-                        }
-                        ModelStatus::Ready => {}
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.label("Mode:");
-                        ui.label(self.settings.listening_mode.as_str());
                     });
 
                     let text = if self.is_listening { "On" } else { "Off" };
@@ -686,6 +654,147 @@ impl eframe::App for PerihelionApp {
                         ui.label(self.status_message.as_ref());
                         if self.is_listening {
                             ui.spinner();
+                        }
+                    });
+                }
+
+                View::Manage => {
+                    ui.heading(egui::RichText::new("Manage Models").size(22.0).strong());
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for variant in &[ModelVariant::Small, ModelVariant::Large] {
+                            let variant = *variant;
+                            let is_active = self.active_model == Some(variant) && self.engine.is_some();
+                            let status = self.model_status(variant).clone();
+
+                            egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(egui::RichText::new(variant.label()).size(16.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if is_active {
+                                            ui.colored_label(egui::Color32::GREEN, "● Running");
+                                        } else {
+                                            match &status {
+                                                ModelStatus::Ready => {
+                                                    ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "Downloaded");
+                                                }
+                                                ModelStatus::NotDownloaded => {
+                                                    ui.colored_label(egui::Color32::YELLOW, "Not downloaded");
+                                                }
+                                                ModelStatus::Downloading { .. } => {
+                                                    ui.add_sized([12.0, 12.0], egui::Spinner::new());
+                                                    ui.label("Downloading...");
+                                                }
+                                                ModelStatus::Initializing => {
+                                                    ui.add_sized([12.0, 12.0], egui::Spinner::new());
+                                                    ui.label("Starting...");
+                                                }
+                                                ModelStatus::Error(_) => {
+                                                    ui.colored_label(egui::Color32::RED, "Error");
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+
+                                if variant == ModelVariant::Large {
+                                    if let Some(ram) = self.total_ram_gb {
+                                        if ram < 65.8 {
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(255, 180, 50),
+                                                    format!("Your system has {:.1} GB RAM. The model may crash or run very slowly.", ram),
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+
+                                if let ModelStatus::Downloading { current_file, current_bytes, total_bytes } = &status {
+                                    ui.add_space(4.0);
+                                    if *total_bytes > 0 {
+                                        let progress = *current_bytes as f32 / *total_bytes as f32;
+                                        ui.add_sized(
+                                            [ui.available_width(), 16.0],
+                                            egui::ProgressBar::new(progress).text(format!(
+                                                "{}  {} / {} MB",
+                                                current_file,
+                                                current_bytes / 1_000_000,
+                                                total_bytes / 1_000_000
+                                            )),
+                                        );
+                                    } else {
+                                        ui.add_sized(
+                                            [ui.available_width(), 16.0],
+                                            egui::ProgressBar::new(0.0).text("Starting..."),
+                                        );
+                                    }
+                                }
+
+                                if let ModelStatus::Error(e) = &status {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(egui::Color32::RED, e.as_str());
+                                }
+
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    match &status {
+                                        ModelStatus::NotDownloaded | ModelStatus::Error(_) => {
+                                            let already_downloading = self.download_rx.is_some();
+                                            let btn = ui.add_enabled(
+                                                !already_downloading,
+                                                egui::Button::new("Download"),
+                                            );
+                                            if btn.clicked() {
+                                                self.start_download(variant);
+                                            }
+                                        }
+                                        ModelStatus::Ready => {
+                                            if is_active {
+                                                if ui.button("Stop").clicked() {
+                                                    if self.is_listening {
+                                                        self.set_listening(false, ctx);
+                                                    }
+                                                    self.engine = None;
+                                                    self.active_model = None;
+                                                    self.status_message = Cow::Borrowed("Model stopped");
+                                                }
+                                            } else {
+                                                let initializing_any = self.init_rx.is_some();
+                                                let btn = ui.add_enabled(
+                                                    !initializing_any,
+                                                    egui::Button::new("Start"),
+                                                );
+                                                if btn.clicked() {
+                                                    self.start_init_engine(variant, Some(ctx));
+                                                }
+                                            }
+
+                                            ui.add_space(8.0);
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("Delete").color(egui::Color32::from_rgb(200, 80, 80)),
+                                            )).clicked() {
+                                                if is_active {
+                                                    if self.is_listening {
+                                                        self.set_listening(false, ctx);
+                                                    }
+                                                    self.engine = None;
+                                                    self.active_model = None;
+                                                }
+                                                let _ = std::fs::remove_dir_all(variant.model_dir());
+                                                self.set_model_status(variant, ModelStatus::NotDownloaded);
+                                                self.status_message = Cow::Borrowed("Model deleted");
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            });
+                            ui.add_space(8.0);
                         }
                     });
                 }
@@ -804,23 +913,15 @@ impl eframe::App for PerihelionApp {
                         ui.add_space(16.0);
                         if ui.button(egui::RichText::new("Apply Settings & Reload").size(16.0)).clicked() {
                             self.save_config();
-                            self.start_init_engine();
+                            if let Some(variant) = self.active_model {
+                                self.start_init_engine(variant, Some(ctx));
+                            }
                         }
 
                         ui.add_space(20.0);
                         ui.heading(egui::RichText::new("Danger Zone").size(18.0).strong().color(egui::Color32::RED));
                         ui.add_space(8.0);
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
-                            ui.label("If the model's fucked, you can delete it to reinstall it.");
-                            ui.add_space(4.0);
-                            if ui.button(egui::RichText::new("Annihilate Model").size(16.0).color(egui::Color32::RED)).clicked() {
-                                self.set_listening(false, ctx);
-                                let _ = std::fs::remove_dir_all(&self.model_dir);
-                                self.engine = None;
-                                self.model_status = ModelStatus::NotDownloaded;
-                                self.status_message = Cow::Borrowed("Model files gone");
-                            }
-                            ui.add_space(8.0);
                             ui.label("Reset all settings to their factory defaults.");
                             ui.add_space(4.0);
                             if ui.button(egui::RichText::new("Reset Config").size(16.0).color(egui::Color32::RED)).clicked() {
@@ -829,6 +930,8 @@ impl eframe::App for PerihelionApp {
                                 self.save_config();
                                 self.status_message = Cow::Borrowed("Config reset");
                             }
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Use the Manage tab to delete model files.").color(egui::Color32::GRAY));
                         });
                     });
                 }

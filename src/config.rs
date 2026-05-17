@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
+use nanoserde::{DeJson, SerJson};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeJson, SerJson)]
 pub enum ListeningMode {
     AlwaysOn,
     ToggleOsc,
@@ -22,7 +22,7 @@ impl ListeningMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, DeJson, SerJson)]
 pub struct Settings {
     pub listening_mode: ListeningMode,
     pub auto_copy: bool,
@@ -49,7 +49,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, DeJson, SerJson)]
 pub struct AppConfig {
     pub settings: Settings,
     pub selected_device: usize,

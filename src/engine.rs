@@ -1,11 +1,46 @@
 use parking_lot::Mutex;
 use sherpa_onnx::{OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, Wave};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use crate::config::Settings;
 use std::io::Write;
 
-pub const MODEL_REPO: &str = "pantinor/sherpa-onnx-qwen3-asr-0.6b-int8";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVariant {
+    Small,  // 0.6b
+    Large,  // 1.7b
+}
+
+impl ModelVariant {
+    pub fn repo(&self) -> &'static str {
+        match self {
+            ModelVariant::Small => "ilmina/qwen3-asr-0.6b-sherpa-onnx",
+            ModelVariant::Large => "ilmina/qwen3-asr-1.7b-sherpa-onnx",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ModelVariant::Small => "Qwen3-ASR 0.6B",
+            ModelVariant::Large => "Qwen3-ASR 1.7B",
+        }
+    }
+
+    pub fn dir_name(&self) -> &'static str {
+        match self {
+            ModelVariant::Small => "qwen3-asr-0.6b",
+            ModelVariant::Large => "qwen3-asr-1.7b",
+        }
+    }
+
+    pub fn model_dir(&self) -> PathBuf {
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("perihelion")
+            .join("models")
+            .join(self.dir_name())
+    }
+}
 
 pub const MODEL_FILES: &[&str] = &[
     "conv_frontend.onnx",
@@ -21,7 +56,41 @@ pub const STRIP_TAGS: &[&str] = &[
     "<|de|>", "<|it|>", "<|es|>", "<|ru|>", "<|asr|>", "<|text|>",
 ];
 
-pub fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result<OfflineRecognizer> {
+/// Returns total physical RAM in GB, or None if it cannot be determined.
+#[cfg(target_os = "windows")]
+pub fn get_total_ram_gb() -> Option<f64> {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct MEMORYSTATUSEX {
+        dwLength: u32,
+        dwMemoryLoad: u32,
+        ullTotalPhys: u64,
+        ullAvailPhys: u64,
+        ullTotalPageFile: u64,
+        ullAvailPageFile: u64,
+        ullTotalVirtual: u64,
+        ullAvailVirtual: u64,
+        ullAvailExtendedVirtual: u64,
+    }
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+    }
+    let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut mem) };
+    if ok != 0 {
+        Some(mem.ullTotalPhys as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_total_ram_gb() -> Option<f64> {
+    None
+}
+
+pub fn build_recognizer(model_dir: &Path, settings: &Settings) -> Result<OfflineRecognizer, Box<dyn std::error::Error>> {
     let hotwords_file = if !settings.hotwords.trim().is_empty() {
         let hw_path = model_dir.join("hotwords.txt");
         if let Ok(mut f) = std::fs::File::create(&hw_path) {
@@ -65,11 +134,10 @@ pub fn build_recognizer(model_dir: &Path, settings: &Settings) -> anyhow::Result
     };
 
     OfflineRecognizer::create(&config)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create OfflineRecognizer"))
+        .ok_or("Failed to create OfflineRecognizer".into())
 }
 
 pub fn clean_transcription(text: &str) -> String {
-    // Fast path: if no tags present, just trim (avoids any allocation from replace)
     let needs_cleaning = STRIP_TAGS.iter().any(|tag| text.contains(tag));
     if !needs_cleaning {
         let trimmed = text.trim();
@@ -79,15 +147,11 @@ pub fn clean_transcription(text: &str) -> String {
         return trimmed.to_string();
     }
 
-    // Slow path: allocate once, strip in-place
     let mut result = text.to_string();
     for tag in STRIP_TAGS {
-        // Skip the contains() check — replace() on a miss is already O(n) with no alloc
-        // But we already know at least one tag is present
         result = result.replace(tag, "");
     }
 
-    // Some Qwen ASR models hallucinate Chinese text or common short phrases on pure noise.
     let trimmed = result.trim();
     if trimmed.len() == result.len() {
         result
@@ -102,7 +166,7 @@ pub struct AsrEngine {
 }
 
 impl AsrEngine {
-    pub fn new(model_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
+    pub fn new(model_dir: &Path, settings: &Settings) -> Result<Self, Box<dyn std::error::Error>> {
         let recognizer = build_recognizer(model_dir, settings)?;
         Ok(Self {
             recognizer,
@@ -121,7 +185,6 @@ impl AsrEngine {
             return None;
         }
         let new_samples = &buffer[since..];
-        // Use chunks_exact to help LLVM auto-vectorize the sum-of-squares
         let mut sum_sq: f32 = 0.0;
         let chunks = new_samples.chunks_exact(4);
         let remainder = chunks.remainder();
@@ -145,7 +208,7 @@ impl AsrEngine {
         taken
     }
 
-    pub fn transcribe_samples(&self, sample_rate: i32, samples: &[f32]) -> anyhow::Result<String> {
+    pub fn transcribe_samples(&self, sample_rate: i32, samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(sample_rate, samples);
         self.recognizer.decode(&stream);
@@ -153,15 +216,15 @@ impl AsrEngine {
         Ok(result.map(|r| r.text).unwrap_or_default())
     }
 
-    pub fn transcribe_file(&self, wav_path: &Path) -> anyhow::Result<String> {
+    pub fn transcribe_file(&self, wav_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
         let wave = Wave::read(wav_path.to_str().unwrap_or(""))
-            .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file"))?;
+            .ok_or("Failed to read WAV file")?;
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(wave.sample_rate(), wave.samples());
         self.recognizer.decode(&stream);
         let result = stream
             .get_result()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get recognition result"))?;
+            .ok_or("Failed to get recognition result")?;
         Ok(result.text)
     }
 }

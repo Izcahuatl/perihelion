@@ -12,9 +12,7 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f
         return Cow::Borrowed(input);
     }
 
-    // For the common 48kHz→16kHz (ratio=3) or 44.1kHz→16kHz case,
-    // fuse the anti-alias filter directly into the interpolation to avoid
-    // allocating an intermediate buffer
+    // cause ts sucks we gotta fuse the anti-alias filter directly into the interpolation to avoid allocating an intermediate buffer
     let ratio = in_rate as f32 / out_rate as f32;
     if in_rate > out_rate {
         let factor = (in_rate / out_rate) as usize;
@@ -28,7 +26,7 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f
                 let idx = in_pos as usize; // floor for positive values
                 let frac = in_pos - idx as f32;
 
-                // Inline the moving-average filter for each needed sample
+                // inline the moving-average filter for each needed sample
                 if idx + 1 < filtered_len {
                     let s0: f32 = input[idx..idx + factor].iter().sum::<f32>() * inv_factor;
                     let s1: f32 = input[idx + 1..idx + 1 + factor].iter().sum::<f32>() * inv_factor;
@@ -42,7 +40,7 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f
         }
     }
 
-    // General case for upsampling or non-integer ratios
+    // general case for upsampling or non-integer ratios
     let out_len = (input.len() as f32 / ratio).ceil() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
@@ -86,7 +84,6 @@ pub fn run_audio_capture(
 
     let host = cpal::default_host();
 
-    // Get the device at the specified index
     let device = {
         let mut device_iter = match host.input_devices() {
             Ok(iter) => iter,
@@ -118,10 +115,9 @@ pub fn run_audio_capture(
 
     let sample_rate = config.sample_rate() as i32;
     let channels = config.channels() as usize;
-    // Process every 0.1 seconds of audio
+    // mmmphhh imm so full of audio
     let chunk_size = ((sample_rate as usize) / 10).max(1024);
 
-    // Clear buffer from previous runs before starting capture
     engine.clear_buffer();
 
     macro_rules! build_stream {
@@ -167,7 +163,6 @@ pub fn run_audio_capture(
             let mut silence_chunks = 0;
             let mut is_speaking = false;
 
-            // Keep the stream alive while running
             while running.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -182,7 +177,6 @@ pub fn run_audio_capture(
                     }
 
                     if !is_speaking {
-                        // If we haven't started speaking yet, clear out old silence so it doesn't build up
                         if total_len > sample_rate as usize * 3 {
                             engine.clear_buffer();
                             last_len = 0;
@@ -190,7 +184,6 @@ pub fn run_audio_capture(
                         continue;
                     }
 
-                    // If user stopped speaking (0.6 seconds of silence = 6 chunks)
                     if silence_chunks >= 6 {
                         let samples_to_process = engine.clear_buffer();
                         last_len = 0;
@@ -205,7 +198,6 @@ pub fn run_audio_capture(
                 }
             }
 
-            // Transcribe any remaining samples and clear out the buffer
             let samples = engine.clear_buffer();
             if !samples.is_empty() && is_speaking {
                 try_transcribe_and_send(&*engine, &samples, sample_rate as u32, &tx, &ctx);
