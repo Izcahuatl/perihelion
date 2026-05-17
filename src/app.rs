@@ -693,7 +693,7 @@ impl eframe::App for PerihelionApp {
 
                                 if variant == ModelVariant::Large {
                                     if let Some(ram) = self.total_ram_gb {
-                                        if ram < 65.8 {
+                                        if ram < 15.8 {
                                             ui.add_space(4.0);
                                             ui.horizontal(|ui| {
                                                 ui.colored_label(
