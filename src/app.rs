@@ -1,4 +1,3 @@
-
 use eframe::egui;
 use std::borrow::Cow;
 use std::net::UdpSocket;
@@ -30,6 +29,7 @@ impl PartialEq for ModelStatus {
     }
 }
 impl Eq for ModelStatus {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Main,
@@ -43,6 +43,7 @@ impl Default for View {
         View::Main
     }
 }
+
 pub struct PerihelionApp {
     view: View,
     model_status_small: ModelStatus,
@@ -158,29 +159,29 @@ impl PerihelionApp {
         let repo = variant.repo();
         let (tx, rx) = channel();
         self.download_rx = Some(rx);
-        let files: Vec<String> = MODEL_FILES.iter().map(|f: &&str| f.to_string()).collect();
+        let files = MODEL_FILES;
 
         thread::spawn(move || {
             std::fs::create_dir_all(&model_dir).ok();
-            for file in &files {
+            for &file in files {
                 let url = format!(
                     "https://huggingface.co/{}/resolve/main/{}",
                     repo, file
                 );
-                let dest = model_dir.join(file.as_str());
+                let dest = model_dir.join(file);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
                 if dest.exists() {
-                    let _ = tx.send(DownloadEvent::FileDone(file.clone()));
+                    let _ = tx.send(DownloadEvent::FileDone(file.to_string()));
                     continue;
                 }
-                let file_arc: Arc<str> = Arc::from(file.as_str());
+                let file_arc: Arc<str> = Arc::from(file);
                 if let Err(e) = download_file_with_progress(&url, &dest, &tx, &file_arc) {
                     let _ = tx.send(DownloadEvent::Error(format!("{}: {}", file, e)));
                     return;
                 }
-                let _ = tx.send(DownloadEvent::FileDone(file.clone()));
+                let _ = tx.send(DownloadEvent::FileDone(file.to_string()));
             }
             let _ = tx.send(DownloadEvent::AllDone);
         });
@@ -349,17 +350,12 @@ impl PerihelionApp {
     }
 
     fn sync_listening_state(&mut self, ctx: &egui::Context) {
-        match self.settings.listening_mode {
-            ListeningMode::AlwaysOn => {
-                if !self.is_listening {
-                    self.set_listening(true, ctx);
-                    self.status_message = Cow::Borrowed("Always On");
-                }
-            }
-            ListeningMode::ToggleButton => {
-            }
-            ListeningMode::ToggleOsc => {
-            }
+        if self.settings.listening_mode == ListeningMode::AlwaysOn
+            && !self.is_listening
+            && self.engine.is_some()
+        {
+            self.set_listening(true, ctx);
+            self.status_message = Cow::Borrowed("Always On");
         }
     }
 
@@ -430,17 +426,8 @@ impl PerihelionApp {
     fn send_osc_typing(&self, typing: bool) {
         self.send_osc_message("/chatbox/typing", vec![rosc::OscType::Bool(typing)]);
     }
-
-    fn start_listening(&mut self, ctx: &egui::Context) {
-        self.set_listening(true, ctx);
-        self.status_message = Cow::Borrowed("Listening...");
-    }
-
-    fn stop_listening(&mut self, ctx: &egui::Context) {
-        self.set_listening(false, ctx);
-        self.status_message = Cow::Borrowed("Ready");
-    }
 }
+
 impl Default for PerihelionApp {
     fn default() -> Self {
         let small_exists = Self::check_model_exists(&ModelVariant::Small.model_dir());
@@ -482,6 +469,7 @@ impl Default for PerihelionApp {
         }
     }
 }
+
 impl eframe::App for PerihelionApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_config();
@@ -595,7 +583,8 @@ impl eframe::App for PerihelionApp {
                                         }
                                         _ => {}
                                     }
-                                    ui.label(format!("{}:", variant.label()));
+                                    ui.label(variant.label());
+                                    ui.label("·");
                                 } else {
                                     ui.colored_label(egui::Color32::GRAY, "none");
                                     ui.label("Model:");
@@ -619,9 +608,11 @@ impl eframe::App for PerihelionApp {
                     let response = ui.add_sized([avail, 40.0], button);
                     if can_click && response.clicked() {
                         if self.is_listening {
-                            self.stop_listening(ctx);
+                            self.set_listening(false, ctx);
+                            self.status_message = Cow::Borrowed("Ready");
                         } else {
-                            self.start_listening(ctx);
+                            self.set_listening(true, ctx);
+                            self.status_message = Cow::Borrowed("Listening...");
                         }
                     }
 
@@ -846,7 +837,6 @@ impl eframe::App for PerihelionApp {
                         ui.add_space(4.0);
                         egui::Frame::group(&ctx.style()).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let device_names: Vec<&str> = self.available_devices.iter().map(|s| s.as_str()).collect();
                                 egui::ComboBox::from_id_salt("device_cb")
                                     .selected_text(
                                         self.available_devices.get(self.selected_device)
@@ -855,11 +845,11 @@ impl eframe::App for PerihelionApp {
                                     )
                                     .width(260.0)
                                     .show_ui(ui, |ui| {
-                                        for (i, device_name) in device_names.iter().enumerate() {
+                                        for (i, name) in self.available_devices.iter().enumerate() {
                                             ui.selectable_value(
                                                 &mut self.selected_device,
                                                 i,
-                                                *device_name,
+                                                name.as_str(),
                                             );
                                         }
                                     });

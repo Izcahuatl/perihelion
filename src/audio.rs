@@ -12,7 +12,6 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f
         return Cow::Borrowed(input);
     }
 
-    // cause ts sucks we gotta fuse the anti-alias filter directly into the interpolation to avoid allocating an intermediate buffer
     let ratio = in_rate as f32 / out_rate as f32;
     if in_rate > out_rate {
         let factor = (in_rate / out_rate) as usize;
@@ -23,10 +22,9 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f
             let mut out = Vec::with_capacity(actual_out_len);
             for i in 0..actual_out_len {
                 let in_pos = i as f32 * ratio;
-                let idx = in_pos as usize; // floor for positive values
+                let idx = in_pos as usize;
                 let frac = in_pos - idx as f32;
 
-                // inline the moving-average filter for each needed sample
                 if idx + 1 < filtered_len {
                     let s0: f32 = input[idx..idx + factor].iter().sum::<f32>() * inv_factor;
                     let s1: f32 = input[idx + 1..idx + 1 + factor].iter().sum::<f32>() * inv_factor;
@@ -40,7 +38,6 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Cow<'_, [f
         }
     }
 
-    // general case for upsampling or non-integer ratios
     let out_len = (input.len() as f32 / ratio).ceil() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
@@ -113,9 +110,8 @@ pub fn run_audio_capture(
         }
     };
 
-    let sample_rate = config.sample_rate() as i32;
+    let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
-    // mmmphhh imm so full of audio
     let chunk_size = ((sample_rate as usize) / 10).max(1024);
 
     engine.clear_buffer();
@@ -191,7 +187,7 @@ pub fn run_audio_capture(
                         is_speaking = false;
 
                         if !samples_to_process.is_empty() {
-                            try_transcribe_and_send(&*engine, &samples_to_process, sample_rate as u32, &tx, &ctx);
+                            try_transcribe_and_send(&engine, &samples_to_process, sample_rate, &tx, &ctx);
                         }
                         continue;
                     }
@@ -200,7 +196,7 @@ pub fn run_audio_capture(
 
             let samples = engine.clear_buffer();
             if !samples.is_empty() && is_speaking {
-                try_transcribe_and_send(&*engine, &samples, sample_rate as u32, &tx, &ctx);
+                try_transcribe_and_send(&engine, &samples, sample_rate, &tx, &ctx);
             }
         }
         Err(e) => {
