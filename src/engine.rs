@@ -138,8 +138,11 @@ pub fn build_recognizer(model_dir: &Path, settings: &Settings) -> Result<Offline
 }
 
 pub fn clean_transcription(text: &str) -> String {
-    let needs_cleaning = STRIP_TAGS.iter().any(|tag| text.contains(tag));
-    if !needs_cleaning {
+    let lower = text.to_lowercase();
+    let has_tag = STRIP_TAGS.iter().any(|tag| text.contains(tag));
+    let has_lang_pattern = lower.contains("language ") && lower.contains("<asr_text>");
+
+    if !has_tag && !has_lang_pattern {
         let trimmed = text.trim();
         if trimmed.len() == text.len() {
             return text.to_string();
@@ -148,16 +151,27 @@ pub fn clean_transcription(text: &str) -> String {
     }
 
     let mut result = text.to_string();
-    for tag in STRIP_TAGS {
-        result = result.replace(tag, "");
+    if has_tag {
+        for tag in STRIP_TAGS {
+            result = result.replace(tag, "");
+        }
     }
 
-    let trimmed = result.trim();
-    if trimmed.len() == result.len() {
-        result
-    } else {
-        trimmed.to_string()
+    let mut search_pos = 0;
+    while let Some(start_idx) = result[search_pos..].to_lowercase().find("language ") {
+        let abs_start = search_pos + start_idx;
+        let lower_tail = result[abs_start..].to_lowercase();
+        if let Some(end_offset) = lower_tail.find("<asr_text>") {
+            if end_offset < 40 {
+                let actual_end = abs_start + end_offset + "<asr_text>".len();
+                result.replace_range(abs_start..actual_end, "");
+                continue;
+            }
+        }
+        search_pos = abs_start + "language ".len();
     }
+
+    result.trim().to_string()
 }
 
 pub struct AsrEngine {
