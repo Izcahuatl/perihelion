@@ -1,5 +1,5 @@
 # Perihelion
-**TTS app made for VRChat!!**
+**STT app made for VRChat!!**
 
 Perihelion runs a tiny (not) Qwen3 ASR model directly on your machine and connects it to VRChat.
 
@@ -27,13 +27,6 @@ Honestly a lot of it is self-explanatory, but here's some more important stuff s
 - **High Accuracy Mode** uses beam search instead of greedy search. Better  but eats more CPU
   - **Search Depth**
     - 1 to 10. Higher = smarter = slower
-- **Hardware Processor**
-  - `CPU`
-    - Works everywhere. Use this!
-  - `GPU`
-    - DirectML, in case you want speed and can afford it
-  - `GPU-CUDA`
-    - If you have an NVIDIA card and CUDA set up
 - **CPU Threads**
   - 1 to 16. More threads = faster, but please don't increase it from the default `4` unless you know what you're doing
 ### Custom Dictionary
@@ -44,8 +37,6 @@ One word or phrase per line. The model will try harder to recognize these. Hotwo
 ---
 ## Will it run on my grandma's life support?
 If your PC can handle 5 eboy avatars it can handle this.
-
-The model download is ~1 GB and it uses about 1.1 GB of RAM while running
 
 ---
 ## Building it yourself
@@ -63,7 +54,6 @@ You'll find the binary at `target/release/perihelion.exe`
 ## Waaaahh it broke
 **"Model not ready" / won't start**
 - Make sure your PC isn't a coffee maker
-- Set **Hardware Processor** to `CPU`
 - Use **Annihilate Model** and let it re-download
 
 **It's hearing things wrong**
